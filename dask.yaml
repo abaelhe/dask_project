@@ -1,0 +1,180 @@
+# THESE FOR DASK CLIENT
+client-name: 'abael.com'
+scheduler-address: 'tls://gpu01.ops.zzyc.360es.cn:8786'
+
+####
+temporary-directory: '/home/heyijun/dask-workspace/tempdir/'
+
+logging:
+  version: 1
+  disable_existing_loggers: False
+  loggers:
+    distributed:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    distributed.scheduler:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    distributed.server:
+        level: DEBUG # distributed/core.py:Server
+        handlers: [general]
+        propagate: False
+    distributed.worker:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    distributed.client:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    distributed.pubsub:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    distributed.comm.core:
+        level: INFO
+        handlers: [general]
+        propagate: False
+    distributed.comm.tcp:
+        level: ERROR
+        handlers: [general]
+        propagate: False
+    bokeh:
+        level:  INFO
+        handlers: [general]
+        propagate: False
+      # http://stackoverflow.com/questions/21234772/python-tornado-disable-logging-to-stderr
+    tornado:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+    tornado.application:
+        level: DEBUG
+        handlers: [general]
+        propagate: False
+  formatters:
+    brief:
+      format: '[%(asctime)s %(name)s:%(lineno)d, %(funcName)s(), %(levelname)-5s]: %(message)s'
+      datefmt: "%H-%M-%S"
+    precise:
+      format: '[%(asctime)s %(name)s, %(funcName)s(),%(pathname)s:%(lineno)d, %(levelname)-5s]: %(message)s'
+      datefmt: "%Y-%m-%d_%H-%M-%S"
+  handlers:
+    general:
+      class: "logging.handlers.RotatingFileHandler"
+      filename: "/home/heyijun/dask-workspace/dask.log"
+      maxBytes: 1000000000
+      backupCount: 30
+      formatter: brief
+      level: DEBUG
+    debug:
+      class: "logging.handlers.RotatingFileHandler"
+      filename: "/home/heyijun/dask-workspace/dask.log"
+      maxBytes: 1000000000
+      backupCount: 30
+      formatter: brief
+      level: DEBUG
+#      http:
+#        class: "logging.handlers.HTTPHandler"
+#        method: "GET"
+#        host: "www.abael.com:80"
+#        url: "/"
+#        formatter: brief
+#        level: DEBUG
+
+
+distributed:
+  client:
+   heartbeat: 10000  # time between client heartbeats
+
+  comm:
+    compression: auto
+    default-scheme: tls
+    socket-backlog: 10240
+    recent-messages-log-length: 10000  # number of messages to keep for debugging
+
+    timeouts:
+      connect: 1000000          # time before connecting fails
+      tcp: 1000000              # time before calling an unresponsive connection dead
+
+    require-encryption: False   # whether to require encryption on non-local comms
+    tls:
+      ca-file: "/home/heyijun/.dask/ca.crt"
+      scheduler:
+        key: "/home/heyijun/.dask/ca.key"
+        cert: "/home/heyijun/.dask/ca.crt"
+      worker:
+        key: "/home/heyijun/.dask/ca.key"
+        cert: "/home/heyijun/.dask/ca.crt"
+      client:
+        key: "/home/heyijun/.dask/ca.key"
+        cert: "/home/heyijun/.dask/ca.crt"
+  #      ciphers:
+  #        ECDHE-ECDSA-AES128-GCM-SHA256
+
+  scheduler:
+    allowed-failures: 1000     # number of retries before a task is considered bad
+    bandwidth: 1000000000000    # 1000 MB/s estimated worker-worker bandwidth
+    blocked-handlers: []
+    default-data-size: 1000000000
+    # Number of seconds to wait until workers or clients are removed from the events log
+    # after they have been removed from the scheduler
+    events-cleanup-delay: 24h
+    idle-timeout: null      # Shut down after this duration, like "1h" or "30 minutes"
+    transition-log-length: 100000
+    work-stealing: True     # workers should steal tasks from each other
+    worker-ttl: null        # like '60s'. Time to live for workers.  They must heartbeat faster than this
+    preload: ['/home/heyijun/.dask/dask_global.py']
+    preload-argv: []
+    dashboard:
+      tasks:
+        task-stream-length: 100
+      status:
+        task-stream-length: 100
+      tls:
+        ca-file: "/home/heyijun/.dask/ca.crt"
+        key: "/home/heyijun/.dask/ca.key"
+        cert: "/home/heyijun/.dask/ca.crt"
+
+  worker:
+    blocked-handlers: []
+    multiprocessing-method: forkserver # fork, forkserver, spawn
+    use-file-locking: True
+    connections:            # Maximum concurrent connections for data
+      outgoing: 100000          # This helps to control network saturation
+      incoming: 100000
+    preload: ['/home/heyijun/.dask/dask_global.py']
+    preload-argv: []
+    daemon: True
+    profile:
+      interval: 3000        # Time between statistical profiling queries
+      cycle: 10000         # Time between starting new profile
+      low-level: False      # Whether or not to include low-level functions Requires https://github.com/numba/stacktrace
+    memory: # Fractions of worker memory at which we take action to avoid memory blowup Set any of the lower three values to False to turn off the behavior entirely
+      target: 0.80  # target fraction to stay below
+      spill: 0.88  # fraction at which we spill to disk
+      pause: 0.95  # fraction at which we pause worker threads
+      terminate: 0.98  # fraction at which we terminate the worker
+
+  ###################
+  # Bokeh dashboard #
+  ###################
+  dashboard:
+    link: "http://{host}:{port}/status"
+    export-tool: False
+
+  #################
+  #Administrative #
+  #################
+
+  admin:
+    maxconn: 10000,
+    tick:
+      interval: 10000  # time between event loop health checks
+      limit: 100000       # time allowed before triggering a warning
+    log-length: 100000  # default length of logs to keep in memory
+    log-format: '[%(asctime)s %(name)s, %(funcName)s(),%(pathname)s:%(lineno)d, %(levelname)-5s]: %(message)s'
+    pdb-on-err: True # enter debug mode on scheduling error
+
