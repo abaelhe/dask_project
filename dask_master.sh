@@ -56,10 +56,12 @@ sudo nvidia-smi || cuda_env
 
 
 # Join DASK Cluster, NOTE: if specified `--scheduler-file`, then make sure it exists with right permissions and valid!!!
-# Multi-Workers:   --nthreads $( python3.6 -c "import multiprocessing as mp;print(mp.cpu_count())" )
+# Multi-Workers:   --nthreads $( python3.6 -c "import os;print(os.cpu_count())" )
 
 
+pgrep -f dask_master.py && sudo pkill -f dask_master.py
 mkdir -p  ~/dask-workspace/ && \
+   PYTHONPATH=$( [ -z "${PYTHONPATH}" ] && echo "/home/heyijun/.dask" || echo "/home/heyijun/.dask:${PYTHONPATH}" )  \
    nohup python3.6  ~/.dask/dask_master.py --host 0.0.0.0 --port 8786 --dashboard-address 0.0.0.0:8787 \
     --protocol tls  --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
     --local-directory  ~/dask-workspace \

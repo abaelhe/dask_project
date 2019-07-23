@@ -62,13 +62,16 @@ sudo nvidia-smi -L || cuda_env
 # Multi-Workers:   --nthreads $( python3.6 -c "import multiprocessing as mp;print(mp.cpu_count())" )
 
 # tls://gpu01.ops.zzyc.360es.cn:8786
-nohup python3.6  ~/.dask/dask_cuda.py --name $(sudo hostname | sed "s/.ops.zzyc.360es.cn//") --reconnect --nthreads 1 \
+   pgrep -f dask_cuda.py && sudo pkill -f dask_cuda.py
+   rm -rf ~/dask-workspace/* && \
+   PYTHONPATH=$( [ -z "${PYTHONPATH}" ] && echo "/home/heyijun/.dask" || echo "/home/heyijun/.dask:${PYTHONPATH}" )  \
+   nohup  python3.6  ~/.dask/dask_cuda.py --name $(sudo hostname | sed "s/.ops.zzyc.360es.cn//") --reconnect --nthreads 1 \
     --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
     --local-directory  ~/dask-workspace \
     --preload ~/.dask/dask_global.py \
     --scheduler-file  ~/.dask/dask_scheduler.yaml \
     1>~/dask-workspace/dask-cuda.log 2>>~/dask-workspace/dask-cuda.log &
-
+tail -f ~/dask-workspace/dask*.log
 
 
 

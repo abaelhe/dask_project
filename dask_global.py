@@ -11,6 +11,10 @@
 
 # Global Python Path
 
+from tornado import autoreload
+autoreload.start()
+
+
 import sys,os,threading,socket
 DASK_REPO = os.path.expanduser('~/.dask')
 DASK_WORKSPACE = os.path.expanduser('~/dask-workspace')
@@ -20,13 +24,12 @@ DASK_PRIORITY = {'chief': 10,
                  'worker':100,
                  'evaluator':100
                  }
+
 sys.path.insert(0, DASK_REPO)
 LD_LIBRARY_PATH = ['/usr/local/cuda/lib64', '/usr/local/cuda/extras/CUPTI/lib64']
 list([LD_LIBRARY_PATH.append(x) for x in os.environ.get('LD_LIBRARY_PATH', '').split(':') if x not in LD_LIBRARY_PATH])
 os.environ['LD_LIBRARY_PATH']=':'.join(LD_LIBRARY_PATH)
 
-from tornado import autoreload
-autoreload.start()
 
 import numpy as np, pandas as pd, tensorflow as tf
 from multiprocessing import get_all_start_methods
@@ -74,7 +77,7 @@ SECURITY_CLIENT = Security(tls_ca_file=TLS_CA_FILE, tls_client_cert=TLS_CA_CERT,
 
 SCHEDULER_PORT = 8786
 MASTERS ='''gpu01.ops.zzyc.360es.cn'''.strip().splitlines()
-#gpu08.ops.zzyc.360es.cn
+#gpu09.ops.zzyc.360es.cn
 GLOBAL_CLUSTER = list(map(lambda m:'tls://%s:%s'%(m, SCHEDULER_PORT), MASTERS))[0]
 MACHINES = '''
 gpu02.ops.zzyc.360es.cn
@@ -82,7 +85,6 @@ gpu05.ops.zzyc.360es.cn
 gpu06.ops.zzyc.360es.cn
 gpu07.ops.zzyc.360es.cn
 gpu08.ops.zzyc.360es.cn
-gpu09.ops.zzyc.360es.cn
 gpu10.ops.zzyc.360es.cn
 '''.strip().splitlines()
 #gpu04.ops.zzyc.360es.cn : Driver Update Required.
@@ -159,16 +161,22 @@ class TFTaskType(object):
         self.device_filters  = device_filters
 
 
-def cuda_running_pids():
-    processes_memory_usage = os.popen('nvidia-smi pmon -c 1 -s m').read().splitlines()[2:]
-    pids = list(map(lambda x: x.split()[1], processes_memory_usage))
-    return [int(pid_str) for pid_str in pids if pid_str.isdigit()]
+def cuda_free_indexes():
+    gpu_indexes = []
+    for line in os.popen('nvidia-smi pmon -c 1 -s m').read().splitlines()[2:]:
+        line = line.split()
+        if len(line) != 5:
+            continue
+        gpu_index, pid, cpu_gpu_type, fb, command = line
+        if gpu_index.isdigit() and not pid.isdigit() and not fb.isdigit():
+            gpu_indexes.append(int(gpu_index))
+    return gpu_indexes
 
 
 def cuda_free_machines(client=None):
     client = client or GLOBAL_CLUSTER
-    r = client.run(cuda_running_pids)
-    return [node_url for node_url, pids in r.items() if len(pids) == 0]
+    r = client.run(cuda_free_indexes)
+    return [node_url for node_url, indexes in r.items() if len(indexes) == 4]
 
 
 def global_cluster(addr=GLOBAL_CLUSTER, timeout=100000):
@@ -298,11 +306,12 @@ def tensorflow_manager(model_name, tf_config=None, tf_options=None, node_url=Non
 
     return (0, model_name, '')
 
-@gen.coroutine # eg.: job_counts={'ps':10, 'workers':100}, ParameterServers:10, CUDAworkers:100
-def tensorflow_scheduler(model_name, client=None, tf_options=None, tf_port=None, **tf_cluster_spec):
-    active_machines_dict = collections.defaultdict(list)
 
-    for node_url, w in client.scheduler_info()['workers'].items():
+def tensorflow_gen_config(**tf_cluster_spec):
+    active_machines_dict = collections.defaultdict(list)
+    free_node_urls = cuda_free_machines()
+
+    for node_url in free_node_urls:
         node_host, node_port = urlparse(node_url).netloc.rsplit(':', 1)
         active_machines_dict[node_host].append(node_url)
 
@@ -327,6 +336,15 @@ def tensorflow_scheduler(model_name, client=None, tf_options=None, tf_port=None,
             jobs[first_selected] = (job_name, job_machine_index)
 
     tf_configs ={node_url:{'cluster':cluster_spec_json, 'task':{'type':task[0], 'index':task[1]}} for node_url, task in jobs.items()}
+    return tf_configs, dask_spec, jobs
+
+
+
+
+
+@gen.coroutine # eg.: job_counts={'ps':10, 'workers':100}, ParameterServers:10, CUDAworkers:100
+def tensorflow_scheduler(model_name, client=None, tf_options=None, tf_port=None, **tf_cluster_spec):
+    tf_configs, dask_spec, jobs = tensorflow_config(**tf_cluster_spec)
     logger.info('Model Schedule %s: \n  tf_configs:%s\n  dask_spec:%s\n  jobs:%s', model_name, tf_configs, dask_spec, jobs)
 
     tf_options_bytes=tf_options.SerializeToString()
@@ -356,7 +374,7 @@ def tensorflow_scheduler(model_name, client=None, tf_options=None, tf_port=None,
     logger.info('RET EXECUTION:\n')
     for k, v in result.items():
         logger.info('    %s: %s', k, v)
-    raise gen.Return((result, cluster_spec_json, dask_spec))
+    raise gen.Return((result, tf_configs, dask_spec))
 
 
 def start_tensorflow(model_name, client=None, options=None, port=TF_PORT, **kwargs):

@@ -153,6 +153,12 @@ def main(
         dashboard_address=dashboard_address if dashboard else None,
         service_kwargs={"dashboard": {"prefix": dashboard_prefix}},
     )
+
+    def scheduler_autoreload():
+        scheduler.restart(timeout=5)
+    from tornado import autoreload
+    autoreload.add_reload_hook(scheduler_autoreload)
+
     scheduler.start()
     if not preload:
         preload = dask.config.get("distributed.scheduler.preload")
