@@ -161,7 +161,9 @@ class TFTaskType(object):
         self.device_filters  = device_filters
 
 
-def cuda_free_indexes():
+def cuda_free_indexes(dask_worker=None, dask_scheduler=None):
+    import socket
+    name = dask_worker.name if dask_worker else socket.gethostname()
     gpu_indexes = []
     for line in os.popen('nvidia-smi pmon -c 1 -s m').read().splitlines()[2:]:
         line = line.split()
@@ -170,21 +172,22 @@ def cuda_free_indexes():
         gpu_index, pid, cpu_gpu_type, fb, command = line
         if gpu_index.isdigit() and not pid.isdigit() and not fb.isdigit():
             gpu_indexes.append(int(gpu_index))
-    return gpu_indexes
+    return (name, gpu_indexes)
 
 
 def cuda_free_machines(client=None):
     client = client or GLOBAL_CLUSTER
-    r = client.run(cuda_free_indexes)
-    return [node_url for node_url, indexes in r.items() if len(indexes) == 4]
+    r = sync(client.loop, client.run, cuda_free_indexes)
+    return sorted([(node_url,name) for node_url, (name, indexes) in r.items() if len(indexes) == 4], key=lambda x:x[1])
 
 
 def global_cluster(addr=GLOBAL_CLUSTER, timeout=100000):
     global GLOBAL_CLUSTER
     if isinstance(GLOBAL_CLUSTER, str):
-        GLOBAL_CLUSTER = Client(address=addr, name=dask.config.get('client-name') or socket.gethostname(), security=SECURITY_CLIENT)
-    return GLOBAL_CLUSTER
-
+        GLOBAL_CLUSTER = Client(address=addr, name='global.abael.com', security=SECURITY_CLIENT,)
+#                                serializers=['dask'], deserializers=['dask'])
+    return Client(address=addr, name=socket.gethostname(), security=SECURITY_CLIENT,)
+#                                serializers=['msgpack', 'dask', 'error'], deserializers=['msgpack','error', 'dask'])
 
 def tensorflow_devices(xla=None, gpu=True):
     from tensorflow.python.client import device_lib
@@ -214,7 +217,7 @@ def tensorflow_devices(xla=None, gpu=True):
 def tensorflow_options(gpu_mem_fraction=0.9):
     import tensorflow as tf
     Config = tf.compat.v1.ConfigProto
-    print('TENSORFLOW JIT STATUS: %s' %  tf.config.optimizer.get_jit())
+    print('TENSORFLOW JIT STATUS: %s' % tf.config.optimizer.get_jit())
     tf.config.optimizer.set_jit(1)
     tf_options = tf.compat.v1.ConfigProto(log_device_placement=True, allow_soft_placement=True,
                                             gpu_options=tf.compat.v1.GPUOptions(
@@ -230,13 +233,25 @@ def tensorflow_options(gpu_mem_fraction=0.9):
     #s=tf_options.SerializeToString()
     #tf.compat.v1.ConfigProto.FromString(s)
 
+
 # ref.: distributed:worker.py:run(server, comm, function, args=(), kwargs={}, is_coro=None, wait=True):
 # support builtin special kwargs:  dask_worker:server, dask_scheduler:server, ONLY available: distributed.client._run()
-def tensorflow_manager(model_name, tf_config=None, tf_options=None, node_url=None, scheduler_info=None):
+
+@gen.coroutine
+def tensorflow_manager(model_name, tf_configs=None, tf_options=None, scheduler_info=None, cuda_indexes=None,
+            dask_scheduler=None, dask_worker=None):
     logger.info('dask manager start:\n');
 
     os.environ["TF_XLA_FLAGS"] = ("--tf_xla_cpu_global_jit " + os.environ.get("TF_XLA_FLAGS", ""))
     os.environ['XLA_FLAGS']='--xla_hlo_profile'
+    if cuda_indexes: # we explicitly assign GPU indexes to use; let tensorflow aware of these indexes
+        os.environ['CUDA_VISIBLE_DEVICES'] = cuda_indexes
+
+    node_name = dask_worker.name
+    node_addr = dask_worker.address
+    tf_options =json.loads(tf_options) if isinstance(tf_options, str) else tf_options
+    tf_configs =json.loads(tf_configs) if isinstance(tf_configs, str) else tf_configs
+    tf_config = tf_configs[(node_name, node_addr)]
     import tensorflow as tf
 
     using_gpu_devices = tensorflow_devices(xla=True, gpu=True)
@@ -251,13 +266,10 @@ def tensorflow_manager(model_name, tf_config=None, tf_options=None, node_url=Non
     GlobalConfigProto.intra_op_parallelism_threads=len(using_gpu_devices)
     GlobalConfigProto.graph_options.optimizer_options.global_jit_level = tf.compat.v1.OptimizerOptions.ON_1
 
-
-    #    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index) # 设定使用哪几块显卡
-
     dask_context = {
          'model_name': model_name,
-         'tensor_task':'%s:%s' %(node_url, ','.join(using_device_names)),
-         'worker_addr': node_url,
+         'tensor_task':'%s:%s' %(node_name, ','.join(using_device_names)),
+         'worker_addr': node_name,
          'schduler_addr': scheduler_info,
          'workspace': DASK_WORKSPACE,
          'local_dir': os.getcwd(),
@@ -282,6 +294,7 @@ def tensorflow_manager(model_name, tf_config=None, tf_options=None, node_url=Non
 
     cwd = os.getcwd()
     sys_path = sys.path[:]
+    msg = ''
     try:
         assert os.path.exists(model_path) and os.path.isfile(os.path.join(model_path, '__init__.py')) , 'Ensure model:"%s" upload to MasterNode:MODEL_POOL_DIR, and included a "__init__.py"'
         sys.path = [model_path, DASK_WORKSPACE] + sys_path
@@ -291,29 +304,36 @@ def tensorflow_manager(model_name, tf_config=None, tf_options=None, node_url=Non
         # with tf.device(tf.compat.v1.train.replica_device_setter(cluster=cluster_spec)):
         #    tf_session = tf.compat.v1.Session(config=GlobalConfigProto)
         model = importlib.import_module(import_path)
-        model.main(GlobalConfigProto)
+        from tornado.ioloop import IOLoop
+        loop = IOLoop.current()
+        msg = yield loop.run_in_executor(None, model.main, GlobalConfigProto)
     except Exception as e:
-        os.chdir(cwd)
         fio = six.StringIO()
         traceback.print_exc(file=fio)
-        logger.info('dask worker error:\ntf_configProto:%s\ndask_context:%s\nexception:%s\n', repr(GlobalConfigProto), dask_context, fio.getvalue())
-        return (-1, model_name, fio.getvalue())
+        msg = fio.getvalue()
+        logger.info('dask worker error:\ntf_configProto:%s\ndask_context:%s\nexception:%s\n', repr(GlobalConfigProto), dask_context, msg)
     else:
         logger.info('dask worker done:\ntf_configProto:%s\ndask_context:%s', repr(GlobalConfigProto), dask_context)
     finally:
         sys.path = sys_path
         os.chdir(cwd)
 
-    return (0, model_name, '')
+    raise gen.Return({'result':msg, 'tf_config':tf_config, 'dask_context':dask_context})
 
 
-def tensorflow_gen_config(**tf_cluster_spec):
+def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **tf_cluster_spec):
     active_machines_dict = collections.defaultdict(list)
-    free_node_urls = cuda_free_machines()
+    free_node_urls = free_node_name_map or global_cluster().run(cuda_free_indexes)
+    if len(tf_cluster_spec) == 0:
+        if len(free_node_urls) < 3:
+            raise Exception('All Machines is busy, Total Available:%s' % len(free_node_urls))
+        tf_cluster_spec['chief'] =1
+        tf_cluster_spec['ps'] =1
+        tf_cluster_spec['worker']=len(free_node_urls) -2
 
-    for node_url in free_node_urls:
+    for node_url, node_name in free_node_urls:
         node_host, node_port = urlparse(node_url).netloc.rsplit(':', 1)
-        active_machines_dict[node_host].append(node_url)
+        active_machines_dict[node_name].append(node_url)
 
     for node_addrs in active_machines_dict.values():
         node_addrs.sort()
@@ -328,53 +348,61 @@ def tensorflow_gen_config(**tf_cluster_spec):
     iter_active_machines = iter(sorted(active_machines_dict.items(), key=lambda x:x[0]))
     for job_name, machine_total in tf_cluster_spec.items():
         for job_machine_index in range(machine_total):
-            (node_host, node_urls) = next(iter_active_machines)
+            (node_name, node_urls) = next(iter_active_machines)
             first_selected = node_urls[0]
             host, dask_port = urlparse(first_selected).netloc.rsplit(':',1)
             dask_spec[job_name].append({'url':first_selected, 'job':job_name,  'task_index':job_machine_index})
             cluster_spec_json[job_name].append('%s:%d' % (host, int(TF_PORT))) # DASK PORT => TF PORT
-            jobs[first_selected] = (job_name, job_machine_index)
+            jobs[(node_name, first_selected)] = (job_name, job_machine_index)
 
-    tf_configs ={node_url:{'cluster':cluster_spec_json, 'task':{'type':task[0], 'index':task[1]}} for node_url, task in jobs.items()}
+    tf_configs ={(node_name, node_url):{'cluster':cluster_spec_json, 'task':{'type':task[0], 'index':task[1]}} for (node_name, node_url), task in jobs.items()}
+
+    if save:
+        chief_or_master = [(node_url, tf_config) for node_url, tf_config in tf_configs.items() if tf_config['task']['type'] in ('chief', 'master')]
+        pses = [(node_url, tf_config) for node_url, tf_config in tf_configs.items() if tf_config['task']['type'] in ('ps',)]
+        workers = [(node_url, tf_config) for node_url, tf_config in tf_configs.items() if tf_config['task']['type'] in ('worker',)]
+
+        with open(save, 'wb') as jsf:
+            jsf.write(json.dumps(chief_or_master).encode())
+            jsf.write(json.dumps(pses).encode())
+            jsf.write(json.dumps(workers).encode())
+
     return tf_configs, dask_spec, jobs
-
-
-
 
 
 @gen.coroutine # eg.: job_counts={'ps':10, 'workers':100}, ParameterServers:10, CUDAworkers:100
 def tensorflow_scheduler(model_name, client=None, tf_options=None, tf_port=None, **tf_cluster_spec):
-    tf_configs, dask_spec, jobs = tensorflow_config(**tf_cluster_spec)
-    logger.info('Model Schedule %s: \n  tf_configs:%s\n  dask_spec:%s\n  jobs:%s', model_name, tf_configs, dask_spec, jobs)
+    r =yield client.run(cuda_free_indexes)
+    free_map=sorted([(node_url, node_name) for node_url, (node_name, indexes) in r.items() if len(indexes) == 4], key=lambda x:x[1])
+    tf_configs, dask_spec, jobs = tensorflow_gen_config(free_node_name_map=free_map, **tf_cluster_spec)
+    logger.info('Model Schedule %s: \n  tf_configs:%s\n\n  dask_spec:%s\n\n  jobs:%s', model_name, tf_configs, dask_spec, jobs)
 
     tf_options_bytes=tf_options.SerializeToString()
+    scheduler_info =yield client.scheduler.identity()
+    scheduler_workers = [node_url for (node_name, node_url) in tf_configs.keys()]
+    result_future = gen.Future()
+    result_future.tf_configs = tf_configs
+    result_future.dask_spec = dask_spec
+    result_future.host_map = free_map
+    result_future.dask_map = jobs
     result = {}
-    thread_pool_executor = ThreadPoolExecutor(max_workers=len(tf_configs))
 
-    chief_or_master = [(node_url, tf_config) for node_url, tf_config  in tf_configs.items() if tf_config['task']['type'] in ('chief', 'master')]
-    pses = [(node_url, tf_config) for node_url, tf_config in tf_configs.items() if tf_config['task']['type'] in ('ps',)]
-    workers = [(node_url, tf_config) for node_url, tf_config in tf_configs.items() if tf_config['task']['type'] in ('worker',)]
+    ret = yield client._run(tensorflow_manager, model_name,
+               tf_configs=tf_configs,
+               tf_options=tf_options_bytes,
+               scheduler_info=scheduler_info,
+               cuda_indexes=None,
+               wait=True,
+               workers=scheduler_workers,
+               )
 
-    with open('./tf_configs.json', 'wb') as jsf:
-        jsf.write(json.dumps(chief_or_master).encode())
-        jsf.write(json.dumps(pses).encode())
-        jsf.write(json.dumps(workers).encode())
-
-    for node_url, tf_config in tf_configs.items():
-        func = partial(client.submit,tensorflow_manager, model_name,
-                               tf_config=tf_config,
-                               tf_options=tf_options_bytes,
-                               node_url = node_url,
-                               scheduler_info=client.scheduler_info(),
-                               priority = DASK_PRIORITY[tf_config['task']['type']],
-                      workers=[node_url], key='%s:%s'%(tf_config['task']['type'], tf_config['task']['index']))
-        result[node_url] = yield client.loop.run_in_executor(thread_pool_executor, func)
-    result = yield result
-    result = merge(result.values())
-    logger.info('RET EXECUTION:\n')
-    for k, v in result.items():
-        logger.info('    %s: %s', k, v)
-    raise gen.Return((result, tf_configs, dask_spec))
+    raise gen.Return({
+        'tf_configs':tf_configs,
+        'tf_options':tf_options,
+        'dask_spec':dask_spec,
+        'dask_map':jobs,
+        'data':ret,
+    })
 
 
 def start_tensorflow(model_name, client=None, options=None, port=TF_PORT, **kwargs):

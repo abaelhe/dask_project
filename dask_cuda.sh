@@ -6,7 +6,7 @@ rpm  -q fuse-sshfs --quiet || sudo yum -y install   fuse-sshfs snappy-devel lz4-
 SSHFS_MOUNTPOINT=/home/heyijun/.dask
 #mount | grep -q "${SSHFS_MOUNTPOINT}"  && fusermount -u "${SSHFS_MOUNTPOINT}"
 #mkdir -p  ${SSHFS_MOUNTPOINT}
-#mount | grep -q "${SSHFS_MOUNTPOINT}" || sshfs gpu01:${SSHFS_MOUNTPOINT}  ${SSHFS_MOUNTPOINT}   -o reconnect,sshfs_sync,no_readahead,sync_readdir,cache=no,disable_hardlink,follow_symlinks,no_check_root,large_read
+#mount | grep -q "${SSHFS_MOUNTPOINT}" || sshfs gpu08:${SSHFS_MOUNTPOINT}  ${SSHFS_MOUNTPOINT}   -o reconnect,sshfs_sync,no_readahead,sync_readdir,cache=no,disable_hardlink,follow_symlinks,no_check_root,large_read
 
 sudo rm -rf /home/heyijun/.config/dask/
 mkdir -p    /home/heyijun/.config/dask/
@@ -61,17 +61,18 @@ sudo nvidia-smi -L || cuda_env
 # Join DASK Cluster, NOTE: if specified `--scheduler-file`, then make sure it exists with right permissions and valid!!!
 # Multi-Workers:   --nthreads $( python3.6 -c "import multiprocessing as mp;print(mp.cpu_count())" )
 
-# tls://gpu01.ops.zzyc.360es.cn:8786
-   pgrep -f dask_cuda.py && sudo pkill -f dask_cuda.py
-   rm -rf ~/dask-workspace/* && \
-   PYTHONPATH=$( [ -z "${PYTHONPATH}" ] && echo "/home/heyijun/.dask" || echo "/home/heyijun/.dask:${PYTHONPATH}" )  \
-   nohup  python3.6  ~/.dask/dask_cuda.py --name $(sudo hostname | sed "s/.ops.zzyc.360es.cn//") --reconnect --nthreads 1 \
+# tls://gpu08.ops.zzyc.360es.cn:8786
+pgrep -f 'dask_cuda.py' && sudo pkill -f 'dask_cuda.py'
+rm -rf ~/dask-workspace/*
+
+PYTHONPATH=$([ -z "${PYTHONPATH}" ] && echo '/home/heyijun/.dask' || echo "/home/heyijun/.dask:${PYTHONPATH}") nohup \
+  python3.6  ~/.dask/dask_cuda.py --name $(sudo hostname | sed "s/.ops.zzyc.360es.cn//") --reconnect --nthreads 1 \
     --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
     --local-directory  ~/dask-workspace \
     --preload ~/.dask/dask_global.py \
     --scheduler-file  ~/.dask/dask_scheduler.yaml \
     1>~/dask-workspace/dask-cuda.log 2>>~/dask-workspace/dask-cuda.log &
-tail -f ~/dask-workspace/dask*.log
+
 
 
 

@@ -1,5 +1,5 @@
 # THESE FOR DASK CLIENT
-client-name: 'abael.com'
+client-name: 'Abael.com'
 scheduler-address: 'tls://gpu01.ops.zzyc.360es.cn:8786'
 
 ####
@@ -87,7 +87,7 @@ logging:
 
 distributed:
   client:
-   heartbeat: 10000  # time between client heartbeats
+   heartbeat: 1000  # time between client heartbeats
 
   comm:
     compression: auto
@@ -143,8 +143,8 @@ distributed:
     multiprocessing-method: forkserver # fork, forkserver, spawn
     use-file-locking: True
     connections:            # Maximum concurrent connections for data
-      outgoing: 100000          # This helps to control network saturation
-      incoming: 100000
+      outgoing: 10000          # This helps to control network saturation
+      incoming: 10000
     preload: ['/home/heyijun/.dask/dask_global.py']
     preload-argv: []
     daemon: True
@@ -172,8 +172,8 @@ distributed:
   admin:
     maxconn: 10000,
     tick:
-      interval: 10000  # time between event loop health checks
-      limit: 100000       # time allowed before triggering a warning
+      interval: 1000  # time between event loop health checks
+      limit: 10000       # time allowed before triggering a warning
     log-length: 100000  # default length of logs to keep in memory
     log-format: '[%(asctime)s %(name)s, %(funcName)s(),%(pathname)s:%(lineno)d, %(levelname)-5s]: %(message)s'
     pdb-on-err: True # enter debug mode on scheduling error

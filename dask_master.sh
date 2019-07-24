@@ -59,7 +59,7 @@ sudo nvidia-smi || cuda_env
 # Multi-Workers:   --nthreads $( python3.6 -c "import os;print(os.cpu_count())" )
 
 
-pgrep -f dask_master.py && sudo pkill -f dask_master.py
+pgrep -f 'dask_master.py' && sudo pkill -f 'dask_master.py'
 mkdir -p  ~/dask-workspace/ && \
    PYTHONPATH=$( [ -z "${PYTHONPATH}" ] && echo "/home/heyijun/.dask" || echo "/home/heyijun/.dask:${PYTHONPATH}" )  \
    nohup python3.6  ~/.dask/dask_master.py --host 0.0.0.0 --port 8786 --dashboard-address 0.0.0.0:8787 \
@@ -67,7 +67,7 @@ mkdir -p  ~/dask-workspace/ && \
     --local-directory  ~/dask-workspace \
     --scheduler-file  ~/.dask/dask_scheduler.yaml \
     --preload ~/.dask/dask_global.py \
-    1> ~/dask-workspace/dask-master.log  2> ~/dask-workspace/dask-master.err  &
+    1> ~/dask-workspace/dask-master.log  2>> ~/dask-workspace/dask-master.log  &
 
 
 
