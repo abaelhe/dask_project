@@ -13,6 +13,7 @@ from __future__ import print_function, division, absolute_import
 
 import atexit, logging, socket, os, toolz, click, dask
 from tornado import gen
+from tornado.process import Subprocess
 from tornado.ioloop import IOLoop, TimeoutError
 
 
@@ -31,7 +32,7 @@ from distributed.preloading import validate_preload_argv
 from distributed.proctitle import (enable_proctitle_on_children, enable_proctitle_on_current)
 
 
-logger = logging.getLogger("distributed.dask_worker")
+logger = logging.getLogger(__file__)
 
 
 def get_n_gpus():
@@ -235,6 +236,7 @@ def main(
             yield gen.sleep(0.2)
 
     install_signal_handlers(loop, cleanup=on_signal)
+    Subprocess.initialize() #'tornado.process.Subprocess' available.
 
     try:
         loop.run_sync(run)

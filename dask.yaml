@@ -38,7 +38,7 @@ logging:
         handlers: [general]
         propagate: False
     distributed.comm.tcp:
-        level: ERROR
+        level: INFO
         handlers: [general]
         propagate: False
     bokeh:
@@ -87,17 +87,17 @@ logging:
 
 distributed:
   client:
-   heartbeat: 1000  # time between client heartbeats
+   heartbeat: 5s  # time between client heartbeats
 
   comm:
     compression: auto
     default-scheme: tls
     socket-backlog: 10240
-    recent-messages-log-length: 10000  # number of messages to keep for debugging
+    recent-messages-log-length: 0  # number of messages to keep for debugging
 
     timeouts:
-      connect: 1000000          # time before connecting fails
-      tcp: 1000000              # time before calling an unresponsive connection dead
+      connect: 10s          # time before connecting fails
+      tcp: 30s              # time before calling an unresponsive connection dead
 
     require-encryption: False   # whether to require encryption on non-local comms
     tls:
@@ -143,8 +143,8 @@ distributed:
     multiprocessing-method: forkserver # fork, forkserver, spawn
     use-file-locking: True
     connections:            # Maximum concurrent connections for data
-      outgoing: 10000          # This helps to control network saturation
-      incoming: 10000
+      outgoing: 1000000          # This helps to control network saturation
+      incoming: 1000000
     preload: ['/home/heyijun/.dask/dask_global.py']
     preload-argv: []
     daemon: True
@@ -172,9 +172,9 @@ distributed:
   admin:
     maxconn: 10000,
     tick:
-      interval: 1000  # time between event loop health checks
-      limit: 10000       # time allowed before triggering a warning
-    log-length: 100000  # default length of logs to keep in memory
+      interval: 100ms  # time between event loop health checks
+      limit: 5s       # time allowed before triggering a warning
+    log-length: 1000  # default length of logs to keep in memory
     log-format: '[%(asctime)s %(name)s, %(funcName)s(),%(pathname)s:%(lineno)d, %(levelname)-5s]: %(message)s'
     pdb-on-err: True # enter debug mode on scheduling error
 

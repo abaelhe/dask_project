@@ -52,7 +52,7 @@ sudo nvidia-smi || cuda_env
 
 
 # Tensorflow with GPU Enable
-/usr/local/bin/pip3.6  show tensorflow-gpu > /dev/null || sudo /usr/local/bin/pip3.6 install --index-url=https://pypi.tuna.tsinghua.edu.cn/simple --disable-pip-version-check tensorflow-gpu django
+/usr/local/bin/pip3.6  show tensorflow-gpu > /dev/null || sudo /usr/local/bin/pip3.6 install --index-url=https://pypi.tuna.tsinghua.edu.cn/simple --disable-pip-version-check tensorflow-gpu django lz4
 
 
 # Join DASK Cluster, NOTE: if specified `--scheduler-file`, then make sure it exists with right permissions and valid!!!
@@ -70,4 +70,16 @@ mkdir -p  ~/dask-workspace/ && \
     1> ~/dask-workspace/dask-master.log  2>> ~/dask-workspace/dask-master.log  &
 
 
+
+
+
+pgrep -f 'dask_master.py' && sudo pkill -f 'dask_master.py'
+mkdir -p  ~/dask-workspace/ && \
+   PYTHONPATH=$( [ -z "${PYTHONPATH}" ] && echo "/home/heyijun/.dask" || echo "/home/heyijun/.dask:${PYTHONPATH}" )  \
+   python3.6  ~/.dask/dask_master.py --host 0.0.0.0 --port 8786 --dashboard-address 0.0.0.0:8787 \
+    --protocol tls  --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
+    --local-directory  ~/dask-workspace \
+    --scheduler-file  ~/.dask/dask_scheduler.yaml \
+    --preload ~/.dask/dask_global.py \
+    1> ~/dask-workspace/dask-master.log  2>> ~/dask-workspace/dask-master.log  &
 

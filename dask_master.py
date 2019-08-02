@@ -24,7 +24,7 @@ import warnings
 import click
 
 from tornado.ioloop import IOLoop
-
+from tornado.process import Subprocess
 from distributed import Scheduler
 from distributed.security import Security
 from distributed.cli.utils import check_python_3, install_signal_handlers
@@ -34,7 +34,7 @@ from distributed.proctitle import (
     enable_proctitle_on_current,
 )
 
-logger = logging.getLogger("distributed.scheduler")
+logger = logging.getLogger(__file__)
 
 
 pem_file_option_type = click.Path(exists=True, resolve_path=True)
@@ -154,11 +154,6 @@ def main(
         service_kwargs={"dashboard": {"prefix": dashboard_prefix}},
     )
 
-    def scheduler_autoreload():
-        scheduler.restart(timeout=5)
-    from tornado import autoreload
-    autoreload.add_reload_hook(scheduler_autoreload)
-
     scheduler.start()
     if not preload:
         preload = dask.config.get("distributed.scheduler.preload")
@@ -172,6 +167,7 @@ def main(
     logger.info("-" * 47)
 
     install_signal_handlers(loop)
+    Subprocess.initialize() #'tornado.process.Subprocess' available.
 
     try:
         loop.start()
