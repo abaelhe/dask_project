@@ -166,8 +166,7 @@ def main(
     logger.info("Local Directory: %26s", local_directory)
     logger.info("-" * 47)
 
-    install_signal_handlers(loop)
-    Subprocess.initialize() #'tornado.process.Subprocess' available.
+    # dask_global.py:global_signal_master()  will receive all signal.
 
     try:
         loop.start()

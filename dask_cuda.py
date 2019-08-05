@@ -221,22 +221,12 @@ def main(
         for i in range(1)]
 
     @gen.coroutine
-    def close_all():
-        # Unregister all workers from scheduler
-        yield [n._close(timeout=2) for n in nannies]
-
-    def on_signal(signum):
-        logger.info("Exiting on signal %d", signum)
-        close_all()
-
-    @gen.coroutine
     def run():
         yield [n._start(addr) for n in nannies]
         while all(n.status != "closed" for n in nannies):
-            yield gen.sleep(0.2)
+            yield gen.sleep(0.1)
 
-    install_signal_handlers(loop, cleanup=on_signal)
-    Subprocess.initialize() #'tornado.process.Subprocess' available.
+    # dask_global.py:global_signal_master()  will receive all signal.
 
     try:
         loop.run_sync(run)

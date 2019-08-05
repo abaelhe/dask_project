@@ -2,6 +2,7 @@
 client-name: 'Abael.com'
 scheduler-address: 'tls://gpu01.ops.zzyc.360es.cn:8786'
 
+
 ####
 temporary-directory: '/home/heyijun/dask-workspace/tempdir/'
 
@@ -10,7 +11,7 @@ logging:
   disable_existing_loggers: False
   loggers:
     distributed:
-        level: DEBUG
+        level: INFO
         handlers: [general]
         propagate: False
     distributed.scheduler:
@@ -18,16 +19,16 @@ logging:
         handlers: [general]
         propagate: False
     distributed.server:
-        level: DEBUG # distributed/core.py:Server
+        level: INFO # distributed/core.py:Server
         handlers: [general]
         propagate: False
     distributed.worker:
         level: DEBUG
-        handlers: [general]
+        handlers: [debug]
         propagate: False
     distributed.client:
         level: DEBUG
-        handlers: [general]
+        handlers: [debug]
         propagate: False
     distributed.pubsub:
         level: DEBUG
@@ -47,11 +48,11 @@ logging:
         propagate: False
       # http://stackoverflow.com/questions/21234772/python-tornado-disable-logging-to-stderr
     tornado:
-        level: DEBUG
+        level: INFO
         handlers: [general]
         propagate: False
     tornado.application:
-        level: DEBUG
+        level: INFO
         handlers: [general]
         propagate: False
   formatters:
@@ -68,7 +69,7 @@ logging:
       maxBytes: 1000000000
       backupCount: 30
       formatter: brief
-      level: DEBUG
+      level: INFO
     debug:
       class: "logging.handlers.RotatingFileHandler"
       filename: "/home/heyijun/dask-workspace/dask.log"
@@ -176,5 +177,5 @@ distributed:
       limit: 5s       # time allowed before triggering a warning
     log-length: 1000  # default length of logs to keep in memory
     log-format: '[%(asctime)s %(name)s, %(funcName)s(),%(pathname)s:%(lineno)d, %(levelname)-5s]: %(message)s'
-    pdb-on-err: True # enter debug mode on scheduling error
+    pdb-on-err: False # enter debug mode on scheduling error
 
