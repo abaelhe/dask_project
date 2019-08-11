@@ -32,7 +32,7 @@ from distributed.preloading import validate_preload_argv
 from distributed.proctitle import (enable_proctitle_on_children, enable_proctitle_on_current)
 
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger('distributed.preloading')
 
 
 def get_n_gpus():

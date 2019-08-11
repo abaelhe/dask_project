@@ -111,8 +111,7 @@ PYTHONPATH=$([ -z "${PYTHONPATH}" ] && echo '/home/heyijun/.dask' || echo "/home
     --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
     --local-directory  ~/dask-workspace \
     --preload ~/.dask/dask_global.py \
-    --scheduler-file  ~/.dask/dask_scheduler.yaml \
-    1>~/dask-workspace/dask-cuda.log 2>>~/dask-workspace/dask-cuda.log &
+    --scheduler-file  ~/.dask/dask_scheduler.yaml  &
 
 
 

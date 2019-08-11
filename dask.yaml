@@ -15,7 +15,7 @@ logging:
         handlers: [general]
         propagate: False
     distributed.scheduler:
-        level: DEBUG
+        level: INFO
         handlers: [general]
         propagate: False
     distributed.server:
@@ -23,15 +23,15 @@ logging:
         handlers: [general]
         propagate: False
     distributed.worker:
-        level: DEBUG
-        handlers: [debug]
+        level: INFO
+        handlers: [general]
         propagate: False
     distributed.client:
         level: DEBUG
         handlers: [debug]
         propagate: False
     distributed.pubsub:
-        level: DEBUG
+        level: INFO
         handlers: [general]
         propagate: False
     distributed.comm.core:
@@ -43,7 +43,7 @@ logging:
         handlers: [general]
         propagate: False
     bokeh:
-        level:  INFO
+        level: INFO
         handlers: [general]
         propagate: False
       # http://stackoverflow.com/questions/21234772/python-tornado-disable-logging-to-stderr
@@ -88,7 +88,7 @@ logging:
 
 distributed:
   client:
-   heartbeat: 5s  # time between client heartbeats
+   heartbeat: 1s  # time between client heartbeats
 
   comm:
     compression: auto

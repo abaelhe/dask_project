@@ -34,7 +34,7 @@ from distributed.proctitle import (
     enable_proctitle_on_current,
 )
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger('distributed.preloading')
 
 
 pem_file_option_type = click.Path(exists=True, resolve_path=True)

@@ -8,7 +8,8 @@
 @license: All Rights Reserved, Abael.com
 """
 
-import six, os, sys, time, threading, itertools, collections, socket,subprocess, json, datetime, traceback, signal
+import imp
+import six, os, sys, time, collections, socket, json, datetime, traceback, signal, zipimport
 from functools import partial,wraps,lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,21 +17,26 @@ from concurrent.futures import ThreadPoolExecutor
 from tornado import gen
 from tornado import process
 from tornado.gen import coroutine, Return, Future
+from tornado.locks import Event, Condition, Lock, Semaphore, BoundedSemaphore
 
-from distributed import Client, get_worker
+from distributed import (Client, Worker, get_worker, secede as worker_secede, get_client, Reschedule, Pub, Sub, Lock,
+                         Variable, worker_client)
+from distributed.threadpoolexecutor import secede as thread_pool_secede
+from distributed.worker import get_thread_identity, thread_state
 import logging
-import multiprocessing
 
-logger = logging.getLogger(__name__)
+
+logger = logging.getLogger('distributed.preloading')
 
 
 from dask_usage import USAGE_INFO
+from dask_signal import IN_DASK, GLOBAL_IOLOOP
 from dask_global import (cuda_free_indexes, global_cluster, urlparse,
     DASK_PYTHONHASHSEED, DASK_PYTHON_INTERPRETER,
     DASK_READ_CHUNK_SIZE, DASK_WORKSPACE, DASK_DATA_POOL_DIR, DASK_MODEL_POOL_DIR)
 
 
-TF_PORT = 1111
+TF_PORT = 11111
 TENSORFLOW_KEYS = ['chief', 'master', 'service', 'session', 'ps', 'worker']
 
 TF_CONFIG_ENV = 'TF_CONFIG'
@@ -69,7 +75,7 @@ class TFTaskType(object):
     WORKER = 'worker'
     CHIEF = 'chief'
     EVALUATOR = 'evaluator' # 'For distributed training, there can only be one `evaluator` task,  means: `task_id=0`'
-
+    dic = {'chief':0, 'master':1, 'ps':2, 'worker':4, 'evaluator':8}
     def __init__(self, task_type): # TaskType And Device Filters association rules
         self.task_type = task_type
         if self._task_type == TFTaskType.MASTER:
@@ -136,22 +142,25 @@ def tensorflow_options(gpu_mem_fraction=0.95):
 
 class TFActor(object):
     def __del__(self):
-        self.dask_worker = None
+        self.recovery()
 
     def __str__(self):
         return "<%s %s>" %(self.__class__.__name__, self.key)
 
     def __init__(self, key, *args, tf_config=None, tf_option=None, scheduler_info=None, **kwargs):
-        logger.info('Accepted Tensorflow Key:%s, Job:%s, Options:%s, Scheduler:%s', key, tf_config, tf_option, scheduler_info)
-        self.key = key
-        self.cwd = os.getcwd()
+        # here we made this thread an OWNER of this task by secede from it's ThreadPoolExecutor.
+        # NOTE: `thread_pool_secede` ONLY works in NON-coroutine actor_exectutor, ref:worker.actor_execute()
         self.dask_worker = get_worker()
+        self.thrid = get_thread_identity()
+
+        thread_pool_secede(adjust=True)
+        self.dask_worker.loop.add_callback(self.dask_worker.transition, thread_state.key, "long-running")
+
+        self.key = key
         self.name = self.dask_worker.name
         self.hostname = socket.gethostname()
         self.address = self.dask_worker.address
-
         self.scheduler_info = scheduler_info
-        self.devices = dict(tensorflow_devices())
 
         model_name = self.key.partition(':')[0]
         self.model_name = model_name[:-4] if model_name.endswith('.zip') else model_name
@@ -163,20 +172,49 @@ class TFActor(object):
         self.tf_data_pool_dir = os.path.abspath(DASK_DATA_POOL_DIR)
         self.tf_data_dir = os.path.join(self.tf_data_pool_dir, self.model_name)
         self.tf_config_dir = os.path.join(self.tf_data_dir, 'config')
-        self.tf_save_dir = os.path.join(self.tf_data_dir, 'save')
+        self.tf_save_dir = os.path.join(self.tf_data_dir, 'ckpt')
         self.tf_log_dir = os.path.join(self.tf_data_dir, 'log')
+        os.system('mkdir -p %r; rm -rf %r; mkdir -p %r %r %r %r' % (self.tf_save_dir, self.tf_save_dir,
+                  self.tf_data_dir, self.tf_config_dir, self.tf_save_dir, self.tf_log_dir))
+        os.chdir(self.tf_data_dir)
 
+        self.sys_stdio = (sys.__stdin__, sys.__stdout__, sys.__stderr__, sys.stdin, sys.stdout, sys.stderr)
+        self.stdout = open(os.path.join(self.tf_log_dir, '%s.log' % self.key.partition(':')[-1]), 'a+', encoding=sys.stdout.encoding)
+        sys.__stdout__ = sys.__stderr__ = sys.stdout = sys.stderr = self.stdout
+        self.stdin = sys.stdin
+        self.sys_path, self.sys_argv = sys.path[:], sys.argv[:]
+
+        logger.info('Accepted Tensorflow Key:%s, Job:%s, Options:%s, Scheduler:%s', key, tf_config, tf_option, scheduler_info)
+        self.devices = dict(tensorflow_devices())
         self.future_chunk_size = DASK_READ_CHUNK_SIZE
-        self.executor = self.stdin = self.stdout = self.stderr = self._stderr_buf = self._stdout_buf = None
-        self.sys_stderr = (sys.stderr, sys.__stderr__)
-        self.sys_stdout = (sys.stdout, sys.__stdout__)
-        self.sys_path = sys.path
-        self.sys_argv = sys.argv
-
         self.args = args
         self.kwargs = kwargs
-        logger.info('TFNode:(Tensorflow Node) inited at hostname:%s, addr:%s, model:%s', self.hostname, self.address, self.model_name)
-        self.start()
+
+
+        self.exe = None
+        self.result = Future()
+        self.dask_worker.loop.add_callback(self.flight, self.preflight())
+
+    @coroutine
+    def get_result(self):
+        self.log('Tensorflow wait RESULT ... ')
+        r = yield self.result
+        self.log('Tensorflow get RESULT: %s' % r)
+        raise Return(r)
+
+    @coroutine
+    def kill(self, sig=signal.SIGKILL, finish=True):
+        if self.exe:
+            try:
+                os.kill(self.exe.pid, sig)
+            except:
+                pass
+            self.exe = None
+
+        if finish:
+            self.recovery()
+
+        raise Return(0)
 
     def device_info(self, xla=None, gpu=True):
         if xla is None:
@@ -188,7 +226,7 @@ class TFActor(object):
 
     def tensorflow_env(self, tf_option, tf_config, dask_context, cuda_indexes=None):
         model_entrypoint = os.path.join(self.tf_model_pool_dir, self.model_name)
-        zip_ep, pkg_ep = model_entrypoint + '.zip', os.path.join(model_entrypoint, '__main__.py')
+        zip_ep, pkg_ep =model_entrypoint + '.zip', os.path.join(model_entrypoint, '__main__.py')
         if os.path.exists(pkg_ep) and os.path.isfile(pkg_ep):
             model_entrypoint = pkg_ep
         elif os.path.exists(zip_ep) and os.path.isfile(zip_ep):
@@ -196,10 +234,18 @@ class TFActor(object):
         else:
             raise Exception(USAGE_INFO)
 
-        env_dict ={key: os.getenv(key) for key in ('LANG', 'PATH', 'CUDA_HOME', 'LD_LIBRARY_PATH',
-            'USER', 'HOME', 'HOSTNAME', 'SHELL','TERM','SHLVL',  'MAIL',  'SSH_CONNECTION','SSH_TTY','SSH_CLIENT')}
+        env_dict = {}
+
+        for key in ('LANG', 'PATH', 'CUDA_HOME', 'LD_LIBRARY_PATH',
+            'USER', 'HOME', 'HOSTNAME', 'SHELL', 'TERM', 'SHLVL', 'MAIL', 'SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT'):
+            val = os.getenv(key)
+            if val is not None:
+                env_dict[key] = val
+
         env_dict.update(
             XLA_FLAGS='--xla_hlo_profile',
+            TF_DASK_PID=str(os.getpid()),
+            RF_DASK_PGRP=str(os.getpgrp()),
             TF_XLA_FLAGS=("--tf_xla_cpu_global_jit " + os.environ.get("TF_XLA_FLAGS", "")),
             TF_MODEL=self.model_name,
             TF_CONTEXT=json.dumps(dask_context),
@@ -222,101 +268,111 @@ class TFActor(object):
 
         return env_dict
 
-    def future_log_read(self, data, source=None):
-        #log Async Push: 实现异步的日志推送, 相当于 "tail -f" 效果
-        logger.info('%s' % data)
-        print(data)
+    def log(self, msg, *args, flush=True):
+        self.stdout.write((msg % args) if args else msg)
+        if flush:
+            self.stdout.flush()
+
+    def run_model(self, stdin, stdout, *args, **kwargs):
+        import sys
+        sys.stdin = stdin
+        self.stdout = sys.stdout = sys.stderr = sys.__stdout__ = sys.__stderr__ = stdout
+
+        self.log('HERE IN ASYNC SUBPROCESS: %s' % os.getpid())
+
+        model_name = os.getenv('TF_MODEL')
+        model_entry =os.getenv('TF_MODEL_ENTRYPOINT')
+
+        if model_entry.endswith('.zip'):
+            model_root, modname = model_entry, '__main__'
+        elif model_entry.endswith('.py'):
+            model_root, modname = os.path.dirname(model_entry), os.path.basename(model_entry).rsplit('.',1)[0]
+
+        self.log('HERE IN ASYNC MODEL START, %s, %s' % (modname, model_root))
+        sys.path.insert(0, model_root)
+        __import__(modname)
 
 
-    def tensorflow_model_done(self, retcode=0):
-        msg = 'Tensorflow Task Finished %s, %s -> %s' % ('Success' if retcode == 0 else 'Error', self.key, retcode)
-        os.chdir(self.cwd)
-
-        if retcode == 0:
-            self.stdout.write(msg)
-            self.stderr.write(msg)
-        else:
-            self.stderr.write(msg)
-        if self.stdout:
-            self.stdout.close()
-        if self.stderr:
-            self.stderr.close()
-        if self.stdin:
-            self.stdin.flush()
-            if self.stdin != sys.stdin:
-                self.stdin.close()
-
-        sys.stderr, sys.__stderr__ = self.sys_stderr
-        sys.stdout, sys.__stdout__ = self.sys_stdout
-        sys.path, sys.argv = self.sys_path, self.sys_argv
-        self.sys_stderr = self.sys_stdout = self.sys_argv = self.sys_path =self.stdin = self.stdout = self.stderr = None
-        try:
-            os.kill(self.executor.pid, signal.SIGKILL)
-        except:
-            pass
-
-    def start(self):
-        # If this NODE selected for this task
+    def preflight(self):
+        # this NODE is selected for this task
         node_name, node_port, cuda_indexes, dask_url = self.tf_config.pop('dask').split(':', 3)
         job_name, task_index = self.tf_config['task']['type'], self.tf_config['task']['index']
         tensorflow_addr = self.tf_config['cluster'][job_name][task_index]
 
         using_xla_gpu_devices = self.device_info(xla=True, gpu=True)
         using_xla_gpu_device_names = sorted([x['name'] for x in using_xla_gpu_devices])
-        os.system('mkdir -p %r %r %r %r' % (self.tf_data_dir, self.tf_config_dir, self.tf_save_dir, self.tf_log_dir))
-        stdout_path = os.path.join(self.tf_log_dir, '%s.log' % self.key)
-        stderr_path = os.path.join(self.tf_log_dir, '%s.err.log' % self.key)
-        self.stdout = open(stdout_path, 'a+', encoding=sys.stdout.encoding)
-        self.stderr = open(stderr_path, 'a+', encoding=sys.stderr.encoding)
 
-        sys_path, sys_argv, sys_stderr, sys_stdout = sys.path[:], sys.argv[:], sys.stderr, sys.stdout
-        sys.stderr,  sys.__stderr__, sys.stdout,  sys.__stdout__ = self.stderr, self.stderr, self.stdout, self.stdout
-        self.stdin = sys.stdin
+        import tensorflow as tf
+        if isinstance(self.tf_option, (str, bytes)):
+            tf_option = tf.compat.v1.ConfigProto.FromString(self.tf_option)
+        elif self.tf_option is not None:
+            tf_option = self.tf_option
+        else:
+            tf_option = tensorflow_options()
 
-        retval = 0
-        try:
-            os.chdir(self.tf_data_dir)
-            self.stdout.write('Dask Manager Matched: %s -> %s\n' %(self.key, self.address))
+        dask_context = {
+            'model_task': '%s, %s' % (self.key, ','.join(using_xla_gpu_device_names)),
+            'model_addr': tensorflow_addr,
+            'worker_addr': self.address,
+            'schduler_addr': self.scheduler_info,
+            'workspace': DASK_WORKSPACE,
+            'local_dir': self.dask_cwd,
+            'pid': os.getpid(),
+            'thread_id': self.thrid,
+            'code': 0,
+        }
 
-            import tensorflow as tf
-            if isinstance(self.tf_option, (str, bytes)):
-                tf_option = tf.compat.v1.ConfigProto.FromString(self.tf_option)
-            elif self.tf_option is not None:
-                tf_option = self.tf_option
+        env_dict = self.tensorflow_env(tf_option, self.tf_config, dask_context, cuda_indexes=cuda_indexes)
+        cmd = [sys.executable, r'-u', env_dict['TF_MODEL_ENTRYPOINT'], self.key]
+        fmt = 'Model Start, key:%s,\n  cmd:%s\n  dask_context:%s\n  sys.path:%s\n  tf_option:%s\n  tf_config:%s\n\n'
+        self.log(fmt % (self.key, cmd, dask_context, self.sys_path, tf_option, self.tf_config))
+
+        for k, v in env_dict.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                self.log('Error env k:%s, v:%s\n' % (k, v))
+
+        exe_package = partial(process.Subprocess, cmd, executable=DASK_PYTHON_INTERPRETER,
+            cwd=env_dict['TF_DATA_DIR'], env=env_dict, preexec_fn=None,
+            stdin=self.stdin, stdout=self.stdout, stderr=self.stdout, encoding=sys.getdefaultencoding(),
+            pass_fds=(self.stdin.fileno(), self.stdout.fileno()), universal_newlines=False, bufsize=0,
+            restore_signals=False, start_new_session=False)
+
+        return exe_package
+
+    def flight(self, exe_package):
+        # flighting in main thread, since `SIGCHLD` MUST received in it; and then correctly call exit callback.
+        self.exe = exe_package()
+        self.exe.set_exit_callback(self.landed)
+        msg = '\n ***** Tensorflow Task   Inited, key:%s, sub:%s, pid:%s ***** ' %(self.key, self.exe.pid, os.getpid())
+        self.log(msg)
+
+    def landed(self, retval=0):
+        self.result.set_result(retval)
+        msg = '\n ***** Tensorflow Task Finished, key:%s, ret:%s, pid:%s, ***** \n\n' % (self.key, retval, os.getpid())
+        self.log(msg)
+        self.recovery()
+
+    def recovery(self):
+        if self.sys_stdio is None:
+            return
+
+        os.chdir(self.dask_cwd)
+        sys.__stdin__, sys.__stdout__, sys.__stderr__, sys.stdin, sys.stdout, sys.stderr = self.sys_stdio
+        sys.path, sys.argv = self.sys_path, self.sys_argv
+
+        if self.stdin:
+            if self.stdin != sys.__stdin__:
+                self.stdin.close()
             else:
-                tf_option = tensorflow_options()
+                self.stdin.flush()
 
-            dask_context = {
-                 'model_task':'%s, %s' %(self.key, ','.join(using_xla_gpu_device_names)),
-                 'model_addr': tensorflow_addr,
-                 'worker_addr': self.address,
-                 'schduler_addr': self.scheduler_info,
-                 'workspace': DASK_WORKSPACE,
-                 'local_dir': self.cwd,
-                 'pid': os.getpid(),
-                  'thread_id': threading.get_ident(),
-                 'code': 0,
-                }
+        if self.stdout:
+            if self.stdout != sys.__stdout__:
+                self.stdout.close()
+            else:
+                self.stdout.flush()
 
-            env_dict = self.tensorflow_env(tf_option, self.tf_config, dask_context, cuda_indexes=cuda_indexes)
-            cmd = [sys.executable, r'-u', env_dict['TF_MODEL_ENTRYPOINT'], self.key]
-            fmt = 'Model Start, key:%s,\n  cmd:%s\n  dask_context:%s\n  sys.path:%s\n  tf_option:%s\n  tf_config:%s\n\n'
-            self.stdout.write(fmt %(self.key, cmd, dask_context, sys_path, tf_option, self.tf_config))
-
-            self.executor = process.Subprocess(cmd, executable=DASK_PYTHON_INTERPRETER, cwd=env_dict['TF_DATA_DIR'],
-              env=env_dict, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr, encoding=sys.getdefaultencoding(),
-              pass_fds=(self.stdin.fileno(), self.stdout.fileno(), self.stderr.fileno()), universal_newlines=False,
-              preexec_fn=None, restore_signals=False, start_new_session=False)
-            self.executor.set_exit_callback(self.tensorflow_model_done)
-
-        except Exception as e:
-            retval = -1
-            traceback.print_exc(file=self.stderr)
-            self.stderr.write('\n\n')
-            logger.exception('model_key:%s, addr:%s\n', self.key, self.address)
-
-
-        raise Return(retval)
+        self.stdin = self.stdout = self.sys_stdio = self.sys_path = self.sys_argv = self.dask_worker = None
 
 
 def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **tf_cluster_spec):
@@ -331,19 +387,24 @@ def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **t
     for (url, name, indexes) in free_node_urls:
         free_gpu_devices.extend((url, name, idx) for idx in indexes)
 
-    if len(free_gpu_devices) < 3:
+    if len(free_gpu_devices) < 1:
         raise Exception('All Machines is busy, Total Available:%s' % len(free_node_urls))
 
     if len(tf_cluster_spec) == 0:
         tf_cluster_spec['chief'] = 1
+
+    if 'ps' not in tf_cluster_spec and len(free_gpu_devices) > tf_cluster_spec.get('chief', 0):
         tf_cluster_spec['ps'] = 1
-        tf_cluster_spec['worker'] = max(1, len(free_gpu_devices)-2)
+
+    if 'worker' not in tf_cluster_spec and len(free_gpu_devices) > tf_cluster_spec.get('chief', 0):
+        tf_cluster_spec['worker'] = max(1, len(free_gpu_devices)-1)
 #        tf_cluster_spec['worker'] = max(1, (len(free_gpu_devices)-2) // 10)# 预计同时会有10个同事跑GPU任务; 公平调度策略, 预留10个;
 
+    print('tf_cluster_spec: %s' % tf_cluster_spec)
     tf_cluster = collections.defaultdict(list)
     port_allocation = collections.defaultdict(lambda : (TF_PORT - 1))
     chief_allocation = tf_cluster_spec.pop('chief', 1)
-    ps_allocation = tf_cluster_spec.pop('ps', 1)
+    ps_allocation = tf_cluster_spec.pop('ps', 0)
     tf_configs = []
     if chief_allocation:
         job_name = 'chief'
@@ -394,17 +455,25 @@ def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **t
     return tf_configs
 
 
-@coroutine
-def startup_task(model_name, tf_config, tf_option, client, scheduler_info, result_future, thread=False):
-    job_name, job_index = tf_config['task']['type'], tf_config['task']['index']
-    node_name, task_port, cuda_index, node_url = tf_config['dask'].split(':', 3)
-    task_key = '%s:%s:%s@%s:%s:%s' % (model_name, job_name, job_index, node_name, task_port, cuda_index)
+def dask_sork_key(task_key):
+    m, _, n = task_key.partition('@')
+    (model_name, job_name, job_index), (node_name, cuda_index) = m.split(':'), n.split(':')
+    return model_name, TFTaskType.dic[job_name], job_index, node_name, cuda_index
 
-    logger.info('%s: Starting ...' % task_key)
-    actor_startup = yield client.submit(TFActor, task_key,
-            tf_config =tf_config, tf_option =tf_option, scheduler_info =scheduler_info,
-            key=task_key, workers =[node_url], retries =10, priority =100, allow_other_workers = False, actor =True)
-    client.loop.add_callback(lambda: result_future.set_result((task_key, actor_startup)))
+@coroutine
+def startup_actors(scheduler_info, client, model_name, tf_option, tf_configs, future):
+    def gen_func(tf_config):
+        job_name, job_index = tf_config['task']['type'], tf_config['task']['index']
+        node_name, task_port, cuda_index, node_url = tf_config['dask'].split(':', 3)
+        task_key = '%s:%s:%s@%s:%s' % (model_name, job_name, job_index, node_name, cuda_index)
+        actor_startup = partial(client.submit, TFActor, task_key,
+                tf_config =tf_config, tf_option =tf_option, scheduler_info=scheduler_info,
+                key=task_key, workers=[node_url], retries=10, priority=100, allow_other_workers=False, actor=True)
+        return task_key, actor_startup
+
+    startups =[gen_func(tf_config) for tf_config in tf_configs]
+    actors = yield {k:s() for (k, s) in startups}
+    future.set_result(actors)
 
 
 @coroutine # eg.: job_counts={'ps':10, 'workers':100}, ParameterServers:10, CUDAworkers:100
@@ -412,6 +481,7 @@ def tensorflow_scheduler(model_name, client=None, tf_option=None, tf_port=None, 
     scheduler_info =yield client.scheduler.identity()
     cuda_free_map =yield client.run(cuda_free_indexes)
     tf_configs = tensorflow_gen_config(free_node_name_map=cuda_free_map, **tf_cluster_spec)
+
     logger.info('Model Schedule %s: \n  tf_configs:%s\n\n', model_name, tf_configs)
 
     tf_option = tf_option if isinstance(tf_option, (str, bytes)) else (tf_option.SerializeToString() if tf_option else tf_option)
@@ -437,38 +507,36 @@ def tensorflow_scheduler(model_name, client=None, tf_option=None, tf_port=None, 
     client.loop.set_default_executor(ThreadPoolExecutor(max_workers=len(tf_configs)))
 
     result_future = Future()
-    chief_actors = {}
-
-    def chief_add(fu):
-        task_key, actor = fu.result()
-        chief_actors[task_key] = actor
-        logger.info('Tensorflow Started: %s', task_key)
-        if len(chief_actors) == len(tf_configs):
-            logger.info('Tensorflow Cluster All Started: %s', task_key.split(':', 1)[0])
-
     result_future.tf_configs = tf_configs
     result_future.tf_option = tf_option
     result_future.cuda_map = cuda_free_map
 
-    all_futures = []
+
+    chief_future = Future()
+    client.loop.add_callback(startup_actors, scheduler_info, client, model_name, tf_option, tf_configs, chief_future)
+    chief_actors = yield chief_future
+
+    sorted_task_keys = list(sorted(chief_actors.keys(), key=lambda x:dask_sork_key(x)))
+
+    def chief_finish(task_key, actor, fu):
+        value = fu.result()
+        logger.info('Tensorflow Finished[%s/%s], key:%s, val:%s', len(chief_actors), len(tf_configs), task_key, value)
+        chief_actors[task_key] = actor
+        if len(chief_actors) == len(tf_configs):
+            logger.info('Tensorflow Cluster All Finished: %s', chief_actors.keys())
+
     # Chief First.
-    for tf_cfg in (chief_configs + ps_configs):
-        future = Future()
-        future.add_done_callback(chief_add)
-        all_futures.append(future)
-        yield startup_task(model_name, tf_cfg, tf_option, client, scheduler_info, future)
+    for task_key in sorted_task_keys:
+        actor = chief_actors.pop(task_key)
+        logger.info('Tensorflow Started, key:%s', task_key)
+        actor_result = yield actor.get_result()
+        chief_actors[task_key] = actor_result
 
-    # Parallel Start All Other Nodes
-    import pdb;pdb.set_trace()
-    for tf_cfg in other_configs:
-        future = Future()
-        future.add_done_callback(chief_add)
-        all_futures.append(future)
-        submit_task_wrap = partial(startup_task, model_name, tf_cfg, tf_option, client, scheduler_info, future)
-        client.loop.run_in_executor(None, submit_task_wrap)# parallel startup.
+    A = yield chief_actors
 
-    import pdb;pdb.set_trace()
-    A = yield all_futures
+        #submit_task_wrap = partial(startup_task, model_name, tf_cfg, tf_option, client, scheduler_info, future)
+        #client.loop.run_in_executor(None, submit_task_wrap)# parallel startup.
+
     raise Return(chief_actors)
 
 

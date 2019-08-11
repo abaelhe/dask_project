@@ -80,6 +80,5 @@ mkdir -p  ~/dask-workspace/ && \
     --protocol tls  --tls-ca-file ~/.dask/ca.crt --tls-cert ~/.dask/ca.crt --tls-key ~/.dask/ca.key \
     --local-directory  ~/dask-workspace \
     --scheduler-file  ~/.dask/dask_scheduler.yaml \
-    --preload ~/.dask/dask_global.py \
-    1> ~/dask-workspace/dask-master.log  2>> ~/dask-workspace/dask-master.log  &
+    --preload ~/.dask/dask_global.py   &
 

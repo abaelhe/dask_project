@@ -38,8 +38,8 @@ DASK_PYTHONHASHSEED = 0
 DASK_PYTHON_INTERPRETER = '/usr/bin/python3.6'
 DASK_READ_CHUNK_SIZE = 100000
 DASK_REPO = os.path.expanduser('~/.dask')
-DASK_DATA_POOL_DIR = '/home/heyijun/.dask/data_pool'
-DASK_MODEL_POOL_DIR = '/home/heyijun/.dask/model_pool'
+DASK_DATA_POOL_DIR = os.path.abspath('/home/heyijun/.dask/data_pool')
+DASK_MODEL_POOL_DIR = os.path.abspath('/home/heyijun/.dask/model_pool')
 DASK_WORKSPACE = os.path.expanduser('~/dask-workspace')
 DASK_PRIORITY = {
     'chief': 10,
@@ -57,13 +57,14 @@ os.environ['LD_LIBRARY_PATH']=':'.join(LD_LIBRARY_PATH)
 
 
 # place early to ensure dask configuration initialize early;
-from distributed import Client,get_worker
+from distributed import Client,get_worker,get_client
+from distributed.utils import thread_state, set_thread_state
 from distributed.security import Security
 
 
 urllib_parse = six.moves.urllib_parse
 urlparse = urllib_parse.urlparse
-logger = logging.getLogger(__file__)
+logger = logging.getLogger('distributed.preloading')
 
 
 from dask_signal import *
@@ -109,6 +110,24 @@ def cuda_free_indexes(dask_worker=None, dask_scheduler=None):
         if gpu_index.isdigit() and not pid.isdigit() and not fb.isdigit():
             gpu_indexes.append(int(gpu_index))
     return (name, gpu_indexes)
+
+
+def node_thread(thrid, depth=10):
+    frames = sys._current_frames()
+    frame = frames[thrid]
+    call_stack = []
+    for i in range(depth):
+        call_stack.append('%s:%s' % (frame.f_code.co_filename, frame.f_lineno))
+        if frame.f_back:
+            frame = frame.f_back
+        else:
+            break
+    return call_stack
+
+
+def node_threads():
+    return [(thrid, '%s:%s'%(frame.f_code.co_filename, frame.f_lineno))  for thrid, frame in sys._current_frames().items()]
+
 
 
 def global_cluster(addr=GLOBAL_CLUSTER, asynchronous=True, direct_to_workers=True):
