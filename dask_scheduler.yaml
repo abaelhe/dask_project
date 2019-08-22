@@ -1,0 +1,9 @@
+{
+  "type": "AScheduler",
+  "id": "AScheduler-00000000-0000-0000-00000000000000000",
+  "address": "tls://abael.com:8786",
+  "services": {
+    "dashboard": 8787
+  },
+  "workers": {}
+}

@@ -1,6 +1,6 @@
 # THESE FOR DASK CLIENT
 client-name: 'Abael.com'
-scheduler-address: 'tls://gpu01.ops.zzyc.360es.cn:8786'
+scheduler-address: 'tls://abael.com:8786'
 
 
 ####
@@ -10,11 +10,27 @@ logging:
   version: 1
   disable_existing_loggers: False
   loggers:
-    distributed:
+    distributed.client:
+        level: DEBUG  # so we can get all when we need these info.
+        handlers: [debug]
+        propagate: False
+    distributed.pubsub:
         level: INFO
         handlers: [general]
         propagate: False
     distributed.scheduler:
+        level: INFO
+        handlers: [general]
+        propagate: False
+    distributed:
+        level: INFO
+        handlers: [general]
+        propagate: False
+    distributed.preloading:
+        level: INFO
+        handlers: [general]
+        propagate: False
+    distributed.core:
         level: INFO
         handlers: [general]
         propagate: False
@@ -23,14 +39,6 @@ logging:
         handlers: [general]
         propagate: False
     distributed.worker:
-        level: INFO
-        handlers: [general]
-        propagate: False
-    distributed.client:
-        level: DEBUG
-        handlers: [debug]
-        propagate: False
-    distributed.pubsub:
         level: INFO
         handlers: [general]
         propagate: False
@@ -90,6 +98,58 @@ distributed:
   client:
    heartbeat: 1s  # time between client heartbeats
 
+  scheduler:
+    allowed-failures: 1000     # number of retries before a task is considered bad
+    bandwidth: 1000000000000    # 1000 MB/s estimated worker-worker bandwidth
+    blocked-handlers: []
+    default-data-size: 1000000000
+    # Number of seconds to wait until workers or clients are removed from the events log
+    # after they have been removed from the scheduler
+    events-cleanup-delay: 24h
+    idle-timeout: null      # Shut down after this duration, like "1h" or "30 minutes"
+    transition-log-length: 100000
+    work-stealing: True     # workers should steal tasks from each other
+    worker-ttl: 10s  # like '60s'. Time to live for workers. They must heartbeat faster than this
+                    # since most BatchSend interval is 5ms|1ms;
+    preload: ['/home/heyijun/.dask/dask_global.py']
+    preload-argv: []
+    dashboard:
+      tasks:
+        task-stream-length: 10
+      status:
+        task-stream-length: 10
+      tls:
+        ca-file: "/home/heyijun/.dask/ca.crt"
+        key: "/home/heyijun/.dask/ca.key"
+        cert: "/home/heyijun/.dask/ca.crt"
+
+  worker:
+    blocked-handlers: []
+    multiprocessing-method: forkserver # fork, forkserver, spawn
+    use-file-locking: True
+    connections:            # Maximum concurrent connections for data
+      outgoing: 1000000          # This helps to control network saturation
+      incoming: 1000000
+    preload: ['/home/heyijun/.dask/dask_global.py']
+    preload-argv: []
+    daemon: True
+    profile:
+      interval: 3s        # Time between statistical profiling queries
+      cycle: 5s         # Time between starting new profile
+      low-level: False      # Whether or not to include low-level functions Requires https://github.com/numba/stacktrace
+    memory: # Fractions of worker memory at which we take action to avoid memory blowup Set any of the lower three values to False to turn off the behavior entirely
+      target: 0.80  # target fraction to stay below
+      spill: 0.88  # fraction at which we spill to disk
+      pause: 0.95  # fraction at which we pause worker threads
+      terminate: 0.98  # fraction at which we terminate the worker
+
+  ###################
+  # Bokeh dashboard #
+  ###################
+  dashboard:
+    link: "http://{host}:{port}/status"
+    export-tool: False
+
   comm:
     compression: auto
     default-scheme: tls
@@ -114,57 +174,6 @@ distributed:
         cert: "/home/heyijun/.dask/ca.crt"
   #      ciphers:
   #        ECDHE-ECDSA-AES128-GCM-SHA256
-
-  scheduler:
-    allowed-failures: 1000     # number of retries before a task is considered bad
-    bandwidth: 1000000000000    # 1000 MB/s estimated worker-worker bandwidth
-    blocked-handlers: []
-    default-data-size: 1000000000
-    # Number of seconds to wait until workers or clients are removed from the events log
-    # after they have been removed from the scheduler
-    events-cleanup-delay: 24h
-    idle-timeout: null      # Shut down after this duration, like "1h" or "30 minutes"
-    transition-log-length: 100000
-    work-stealing: True     # workers should steal tasks from each other
-    worker-ttl: null        # like '60s'. Time to live for workers.  They must heartbeat faster than this
-    preload: ['/home/heyijun/.dask/dask_global.py']
-    preload-argv: []
-    dashboard:
-      tasks:
-        task-stream-length: 100
-      status:
-        task-stream-length: 100
-      tls:
-        ca-file: "/home/heyijun/.dask/ca.crt"
-        key: "/home/heyijun/.dask/ca.key"
-        cert: "/home/heyijun/.dask/ca.crt"
-
-  worker:
-    blocked-handlers: []
-    multiprocessing-method: forkserver # fork, forkserver, spawn
-    use-file-locking: True
-    connections:            # Maximum concurrent connections for data
-      outgoing: 1000000          # This helps to control network saturation
-      incoming: 1000000
-    preload: ['/home/heyijun/.dask/dask_global.py']
-    preload-argv: []
-    daemon: True
-    profile:
-      interval: 3000        # Time between statistical profiling queries
-      cycle: 10000         # Time between starting new profile
-      low-level: False      # Whether or not to include low-level functions Requires https://github.com/numba/stacktrace
-    memory: # Fractions of worker memory at which we take action to avoid memory blowup Set any of the lower three values to False to turn off the behavior entirely
-      target: 0.80  # target fraction to stay below
-      spill: 0.88  # fraction at which we spill to disk
-      pause: 0.95  # fraction at which we pause worker threads
-      terminate: 0.98  # fraction at which we terminate the worker
-
-  ###################
-  # Bokeh dashboard #
-  ###################
-  dashboard:
-    link: "http://{host}:{port}/status"
-    export-tool: False
 
   #################
   #Administrative #

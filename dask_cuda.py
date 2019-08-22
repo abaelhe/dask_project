@@ -11,17 +11,20 @@
 
 from __future__ import print_function, division, absolute_import
 
-import atexit, logging, socket, os, toolz, click, dask
+import atexit, logging, socket, os, toolz, click, dask, threading
+from time import time, sleep
 from tornado import gen
+from tornado.gen import Future, Return, coroutine
 from tornado.process import Subprocess
 from tornado.ioloop import IOLoop, TimeoutError
 
 
 _ncores = os.cpu_count()
+GPU_KEY = 'CUDA_GPU'
 
 
 from distributed import LocalCluster,Nanny, Worker
-from distributed.comm import get_address_host_port
+from distributed.comm import get_address_host_port, CommClosedError
 from distributed.worker import TOTAL_MEMORY
 from distributed.config import config
 from distributed.utils import get_ip_interface, parse_timedelta
@@ -35,65 +38,70 @@ from distributed.proctitle import (enable_proctitle_on_children, enable_proctitl
 logger = logging.getLogger('distributed.preloading')
 
 
-def get_n_gpus():
-    try:
-        return len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-    except KeyError:
-        return _n_gpus_from_nvidia_smi()
+import pynvml
 
 
-nvidia_ngpus = None
-def _n_gpus_from_nvidia_smi():
-    global nvidia_ngpus
-    if nvidia_ngpus is None:
-        nvidia_ngpus = len(os.popen("nvidia-smi -L").read().strip().split("\n"))
-    return nvidia_ngpus
+def gpu_rscs(w):
+
+    def pids(handle):
+        return [p.pid for p in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)]
+
+    return {GPU_KEY: len([r for r in map(pids, w.gpu_handles) if len(r) == 0])}
 
 
-def cuda_visible_devices(i, visible=None):
-    """ Cycling values for CUDA_VISIBLE_DEVICES environment variable
-    Examples
-    --------
-    >>> cuda_visible_devices(0, range(4))
-    '0,1,2,3'
-    >>> cuda_visible_devices(3, range(8))
-    '3,4,5,6,7,0,1,2'
-    """
-    if visible is None:
-        try:
-            visible = list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(",")))
-        except KeyError:
-            visible = list(range(get_n_gpus()))
-
-    L = visible[i:] + visible[:i]
-    return ",".join(map(str, L))
+def resources_thread(w, secs):
+    while w.status not in (None, "closed", "closing"):
+        rscs = {}
+        rscs.update(gpu_rscs(w))
+        with w.rscs_lock:
+            w.rscs = rscs
+        sleep(secs)
 
 
-class LocalCUDACluster(LocalCluster):
-    def __init__(self, n_workers=None, threads_per_worker=1, memory_limit=None, **kwargs):
-        if n_workers > get_n_gpus():
-            raise ValueError("Can not specify more processes than GPUs")
-        n_workers = n_workers or get_n_gpus()
-        memory_limit = memory_limit or (TOTAL_MEMORY / n_workers)
-        LocalCluster.__init__(self, n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit, **kwargs)
+class ResourcedWorker(Worker):
+    pynvml.nvmlInit()
+    gpu_count = pynvml.nvmlDeviceGetCount()
+    gpu_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(gpu_count)]
 
     @gen.coroutine
-    def _start(self, ip=None, n_workers=0):
-        """ Start all cluster services. """
-        if self.status == "running":
-            return
-        if (ip is None) and (not self.scheduler_port) and (not self.processes):
-            scheduler_address = "inproc://"
-        elif ip is not None and ip.startswith("tls://"):
-            scheduler_address = "%s:%d" % (ip, self.scheduler_port)
+    def collect_resources(self):
+        if not hasattr(self, 'rscs_lock'):
+            self.rscs_lock = threading.Lock()
+            self.rscs = {}
+            self.gpu_thread = threading._start_new_thread(resources_thread, (self, 0.1))
+
+        with self.rscs_lock:
+            rscs = self.rscs
+        self.available_resources.update(rscs)
+        self.total_resources.update(rscs)
+        raise Return(rscs)
+
+    @gen.coroutine
+    def heartbeat(self):
+        if not self.heartbeat_active:
+            self.heartbeat_active = True
+            try:
+                start = time()
+                rscs = yield self.collect_resources()
+                response = yield self.scheduler.heartbeat_worker(
+                    address=self.contact_address, now=time(), metrics=self.get_metrics(), resources=rscs
+                )
+                end = time()
+                middle = (start + end) / 2
+                if response:
+                    if response["status"] == "missing":
+                        yield self._register_with_scheduler()
+                        return
+                    self.scheduler_delay = response["time"] - middle
+                    self.periodic_callbacks["heartbeat"].callback_time = (
+                        response["heartbeat-interval"] * 1000
+                    )
+            except CommClosedError:
+                logger.warning("Heartbeat to scheduler failed")
+            finally:
+                self.heartbeat_active = False
         else:
-            if ip is None:
-                ip = "127.0.0.1"
-            scheduler_address = (ip, self.scheduler_port)
-        self.scheduler.start(scheduler_address)
-        yield [self._start_worker(**self.worker_kwargs, env={"CUDA_VISIBLE_DEVICES": cuda_visible_devices(i)}) for i in range(n_workers)]
-        self.status = "running"
-        raise gen.Return(self)
+            logger.debug("Heartbeat skipped: channel busy")
 
 
 pem_file_option_type = click.Path(exists=True, resolve_path=True)
@@ -174,16 +182,14 @@ def main(
             result = (BokehWorker, {"prefix": bokeh_prefix}) if bokeh_prefix else BokehWorker
             services[("bokeh", bokeh_port)] = result
 
+    rscs = gpu_rscs(ResourcedWorker)
     if resources:
         resources = resources.replace(",", " ").split()
         resources = dict(pair.split("=") for pair in resources)
-        resources ={k:(float(v) if v else 0.0) for k,v in resources.items()}
-    else:
-        resources = None
+        resources ={k: (float(v) if v else 0.0) for k,v in resources.items()}
+        rscs.update(resources)
 
     loop = IOLoop.current()
-
-    kwargs = {"worker_port": None, "listen_address": None}
 
     if not scheduler and not scheduler_file and "scheduler-address" not in config:
         raise ValueError("Need to provide scheduler address like\ndask-worker SCHEDULER_ADDRESS:8786")
@@ -195,6 +201,7 @@ def main(
             host = get_ip_interface(interface)
 
     addr = uri_from_host_port(host, 0, 0) if host else None
+    kwargs = {"worker_port": None, "listen_address": addr}
     if death_timeout is not None:
         death_timeout = parse_timedelta(death_timeout, "s")
 
@@ -205,16 +212,17 @@ def main(
             nthreads=nthreads,
             services=services,
             loop=loop,
-            resources=resources,
+            resources=rscs,
             memory_limit=memory_limit,
             reconnect=reconnect,
-            local_dir=local_directory,
+            local_directory=local_directory,
             death_timeout=death_timeout,
             preload=preload,
             preload_argv=preload_argv,
             security=sec,
+            env={},
+            worker_class=ResourcedWorker,
             contact_address=None,
-            env={"CUDA_VISIBLE_DEVICES": cuda_visible_devices(i)},
             name=name if nthreads == 1 else name + "-" + str(i),
             **kwargs
         )
@@ -222,7 +230,7 @@ def main(
 
     @gen.coroutine
     def run():
-        yield [n._start(addr) for n in nannies]
+        yield [n.start() for n in nannies]
         while all(n.status != "closed" for n in nannies):
             yield gen.sleep(0.1)
 

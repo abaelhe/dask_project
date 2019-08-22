@@ -21,11 +21,13 @@ import sys
 import tempfile
 import warnings
 
-import click
+import click, pickle, collections
 
+from tornado import gen
 from tornado.ioloop import IOLoop
 from tornado.process import Subprocess
 from distributed import Scheduler
+from distributed.scheduler import log_errors, get_address_host, ignoring,CommClosedError, KilledWorker, parse_timedelta
 from distributed.security import Security
 from distributed.cli.utils import check_python_3, install_signal_handlers
 from distributed.preloading import preload_modules, validate_preload_argv
@@ -35,6 +37,110 @@ from distributed.proctitle import (
 )
 
 logger = logging.getLogger('distributed.preloading')
+
+
+class AScheduler(Scheduler):
+    def remove_worker(self, comm=None, address=None, safe=False, close=True):
+        logger.debug("Removing worker %s ", address)
+
+        if self.status == "closed" or not address:
+            return
+
+        address = self.coerce_address(address)
+        if address not in self.workers:
+            return "already-removed"
+
+        ws = self.workers[address]
+
+        with log_errors():
+            try:
+
+                self.log_event(
+                    ["all", address],
+                    {
+                        "action": "remove-worker",
+                        "worker": address,
+                        "processing-tasks": dict(ws.processing),
+                    },
+                )
+                logger.info("Remove worker %s", address)
+
+                recommendations = collections.OrderedDict()
+                for ts in list(ws.processing):
+                    k = ts.key
+                    recommendations[k] = "released"
+                    if not safe:
+                        ts.suspicious += 1
+                        if ts.suspicious > self.allowed_failures:
+                            del recommendations[k]
+                            e = pickle.dumps(
+                                KilledWorker(task=k, last_worker=ws.clean()), -1
+                            )
+                            r = self.transition(k, "erred", exception=e, cause=k)
+                            recommendations.update(r)
+
+                for ts in ws.has_what:
+                    ts.who_has.remove(ws)
+                    if not ts.who_has:
+                        if ts.run_spec:
+                            recommendations[ts.key] = "released"
+                        else:  # pure data
+                            recommendations[ts.key] = "forgotten"
+                ws.has_what.clear()
+
+                self.transitions(recommendations)
+
+                for plugin in self.plugins[:]:
+                    try:
+                        plugin.remove_worker(scheduler=self, worker=address)
+                    except Exception as e:
+                        logger.exception(e)
+
+                if close:
+                    with ignoring(AttributeError, KeyError, CommClosedError):
+                        self.stream_comms[address].send({"op": "close", "report": False})
+
+            finally:
+                if address in self.workers:
+                    self.remove_resources(address)
+
+                host = get_address_host(address)
+                if host in self.host_info:
+                    self.host_info[host]["nthreads"] -= ws.nthreads
+                    self.host_info[host]["addresses"].remove(address)
+                    if not self.host_info[host]["addresses"]:
+                        del self.host_info[host]
+
+                self.total_nthreads -= ws.nthreads
+                self.rpc.remove(address)
+                if address in self.stream_comms:
+                    del self.stream_comms[address]
+                if ws.name in self.aliases:
+                    del self.aliases[ws.name]
+                self.idle.discard(ws)
+                self.saturated.discard(ws)
+                del self.workers[address]
+                ws.status = "closed"
+                self.total_occupancy -= ws.occupancy
+
+            if not self.workers:
+                logger.info("Lost all workers")
+
+            @gen.coroutine
+            def remove_worker_from_events():
+                # If the worker isn't registered anymore after the delay, remove from events
+                if address not in self.workers and address in self.events:
+                    del self.events[address]
+
+            cleanup_delay = parse_timedelta(
+                dask.config.get("distributed.scheduler.events-cleanup-delay")
+            )
+            self.loop.call_later(cleanup_delay, remove_worker_from_events)
+            logger.debug("Removed worker %s", address)
+
+        return "OK"
+
+
 
 
 pem_file_option_type = click.Path(exists=True, resolve_path=True)
@@ -142,7 +248,7 @@ def main(
     loop = IOLoop.current()
     logger.info("-" * 47)
 
-    scheduler = Scheduler(
+    scheduler = AScheduler(
         loop=loop,
         scheduler_file=scheduler_file,
         security=sec,
@@ -154,7 +260,7 @@ def main(
         service_kwargs={"dashboard": {"prefix": dashboard_prefix}},
     )
 
-    scheduler.start()
+    loop.add_callback(scheduler.start)
     if not preload:
         preload = dask.config.get("distributed.scheduler.preload")
     if not preload_argv:

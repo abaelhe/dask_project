@@ -27,7 +27,7 @@ SIG_FROM_NAME= {v:k for k,v in SIG_MAP_NAME.items()}
 
 
 #INT: CTRL+C
-SIG_TERM_DEFAULT = ('PIPE', 'CHLD', 'INT', 'TERM',  'HUP', 'QUIT', 'USR1', 'USR2', 'ALRM', 'XCPU', 'XFSZ', 'VTALRM', 'PROF')
+SIG_TERM_DEFAULT = ('CHLD', 'PIPE', 'INT', 'TERM',  'HUP', 'QUIT', 'USR1', 'USR2', 'ALRM', 'XCPU', 'XFSZ', 'VTALRM', 'PROF')
 
 
 import logging,errno
@@ -74,45 +74,46 @@ def global_safe_release(*args, **kwargs):
 def global_signal_handler(sig, frame):
     global _GLOBAL_CTRLC_TIME
     global GLOBAL_IOLOOP
-    signame = SIG_MAP_NAME_ALL[sig]
-    logger.info('Global Safe Signal Handler, sig:%s, tid:%s, pid:%s, dask:%s', signame, threading.get_ident(), os.getpid(), IN_DASK)
+    global logger
 
-    if signame == 'INT':
+    signame = SIG_MAP_NAME_ALL[sig]
+
+    def log_siginfo(signame, frame):
+        global logger
+        f_code = frame.f_code if frame and hasattr(frame, 'f_code') else None
+        f_line = frame.f_lineno if frame and hasattr(frame, 'f_lineno') else None
+        logfmt = 'Global Safe Signal Handler, sig:%s, tid:%s, pid:%s, dask:%s, frame:%s:%s'
+        args = (signame, threading.get_ident(), os.getpid(), IN_DASK,  f_code, f_line)
+        logger.info(logfmt%args)
+
+    log_signal = partial(log_siginfo, signame, frame)
+    if signame in ('PIPE', 'HUP'):
+        return log_signal()
+    elif signame == 'INT':
+        log_signal()
         now = time.time()
         if (now - _GLOBAL_CTRLC_TIME) < 1: # DOUBLE CTRL+C in ONE second
             GLOBAL_IOLOOP.add_callback_from_signal(global_safe_release)
         else:
             _GLOBAL_CTRLC_TIME = now
-    elif signame == 'PIPE':
-        pass
     elif signame == 'TERM':
-        print("Stop for SIGTERM.")
+        log_signal()
         GLOBAL_IOLOOP.add_callback_from_signal(global_safe_release)
-
     elif signame == 'CHLD':
-        siginfo = 1
-        while siginfo:
+        ret_pid = 1
+        while ret_pid:
             try:
-                siginfo = os.waitid(os.P_ALL, IN_DASK, os.WEXITED | os.WNOHANG)
-            except ChildProcessError as e:
-                break
-            if siginfo:
-                stats = {
-                    os.CLD_EXITED: 'os.CLD_EXITED',
-                    os.CLD_DUMPED: 'os.CLD_DUMPED',
-                    os.CLD_TRAPPED: 'os.CLD_TRAPPED',
-                    os.CLD_CONTINUED: 'os.CLD_CONTINUED',
-                }
-                pid = siginfo.si_pid
-                if pid in Subprocess._waiting:
-                    logger.info("USER:%s, STAT:%s, SIG:%s", pwd.getpwuid(siginfo.si_uid)[0], stats[siginfo.si_code],
-                                siginfo)
-                    subproc = Subprocess._waiting.pop(pid)
-                    subproc.io_loop.add_callback_from_signal(subproc._set_returncode, siginfo.si_status)
-                    continue
-
+                ret_pid, status = os.waitpid(-1, os.WNOHANG)
+            except OSError as e:
+                ret_pid = 0
+            if ret_pid == 0 or ret_pid not in Subprocess._waiting:
+                return
+            subproc = Subprocess._waiting.pop(ret_pid)
+            cb = subproc._exit_callback
+            logger.info('Global Subprocess Term, pid:%s, ret:%s, dask:%s, callback:%s', ret_pid,  status, IN_DASK, cb)
+            subproc.io_loop.add_callback_from_signal(subproc._set_returncode, status)
     else:
-        print("Received sig:%s[%d], frame:%s:%s" % (signame,sig, frame.f_code, frame.f_lineno))
+        log_signal()
         global_safe_release()
 
 
@@ -120,7 +121,7 @@ def global_signal_master(signals=SIG_TERM_DEFAULT):
     global GLOBAL_SIGNAL_REGISTER
 
     # `SIGCHLD` signal will handle by tornado.process.Subprocess, this make it as Supervisor of all it's instances.
-    # Subprocess.initialize()
+    Subprocess.initialize()
 
     for sig_name in list(signals):
         signum = SIG_FROM_NAME[sig_name]
@@ -130,5 +131,4 @@ def global_signal_master(signals=SIG_TERM_DEFAULT):
 
 
 # make sure GLOBAL_IOLOOP actually GLOBAL
-if IN_DASK:
-    GLOBAL_IOLOOP.add_callback(global_signal_master)
+GLOBAL_IOLOOP.add_callback(global_signal_master)

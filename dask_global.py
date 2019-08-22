@@ -11,8 +11,10 @@
 
 
 # Global Python Path
-
-MASTERS ='''gpu01.ops.zzyc.360es.cn'''.strip().splitlines()
+# client = global_cluster(addr='tls://abael.com:8786', asynchronous=False)
+#MASTERS ='''gpu01.ops.zzyc.360es.cn'''.strip().splitlines()
+MASTERS ='''abael.com'''.strip().splitlines()
+#gpu01.ops.zzyc.360es.cn
 MACHINES = '''
 gpu02.ops.zzyc.360es.cn
 gpu05.ops.zzyc.360es.cn
@@ -26,20 +28,24 @@ gpu10.ops.zzyc.360es.cn
 #gpu10.ops.zzyc.360es.cn
 
 
+from functools import partial
+from tornado import autoreload, gen
+if not getattr(autoreload, 'main_started', None):
+    setattr(autoreload, 'main_started', True)
+    autoreload.start()
 
-from tornado import autoreload
-autoreload.start()
+
+import sys,os,six,threading,socket,logging,json,base64, struct, tornado
 
 
-import sys,os,six,threading,socket,logging,json
-
+iostream_allows_memoryview = tornado.version_info >= (4, 5)
 
 DASK_PYTHONHASHSEED = 0
 DASK_PYTHON_INTERPRETER = '/usr/bin/python3.6'
 DASK_READ_CHUNK_SIZE = 100000
 DASK_REPO = os.path.expanduser('~/.dask')
-DASK_DATA_POOL_DIR = os.path.abspath('/home/heyijun/.dask/data_pool')
-DASK_MODEL_POOL_DIR = os.path.abspath('/home/heyijun/.dask/model_pool')
+DASK_DATA_POOL_DIR = os.path.abspath(os.path.expanduser('~/.dask/data_pool'))
+DASK_MODEL_POOL_DIR = os.path.abspath(os.path.expanduser('~/.dask/model_pool'))
 DASK_WORKSPACE = os.path.expanduser('~/dask-workspace')
 DASK_PRIORITY = {
     'chief': 10,
@@ -60,6 +66,7 @@ os.environ['LD_LIBRARY_PATH']=':'.join(LD_LIBRARY_PATH)
 from distributed import Client,get_worker,get_client
 from distributed.utils import thread_state, set_thread_state
 from distributed.security import Security
+from distributed.comm.tcp import ensure_bytes, nbytes, to_frames, from_frames, get_tcp_server_address
 
 
 urllib_parse = six.moves.urllib_parse
@@ -129,7 +136,6 @@ def node_threads():
     return [(thrid, '%s:%s'%(frame.f_code.co_filename, frame.f_lineno))  for thrid, frame in sys._current_frames().items()]
 
 
-
 def global_cluster(addr=GLOBAL_CLUSTER, asynchronous=True, direct_to_workers=True):
     global GLOBAL_CLUSTER
 
@@ -142,4 +148,109 @@ def global_cluster(addr=GLOBAL_CLUSTER, asynchronous=True, direct_to_workers=Tru
             asynchronous=asynchronous, direct_to_workers=False,
             # serializers=['msgpack', 'dask', 'error'], deserializers=['msgpack','error', 'dask'],
         )
+
+# `yield async(client, msg)` when return, that will ensure the msg data has been sync flushed into Kernel Cache.
+# bypass the client's Batched Send Communication, give us best choice based on reality.
+#             1. client.scheduler_comm: <class 'distributed.batched.BatchedSend'>     # periodically send.
+#        2. client.scheduler_comm.comm: <class 'distributed.comm.tcp.TLS'>            # provide sync `async write`
+# 3. client.scheduler_comm.comm.stream: <class 'tornado.iostream.SSLIOStream'>        # provide sync `async write`
+# client.scheduler_comm.comm.stream.
+
+@gen.coroutine
+def async_send(client, msg):
+    batch_send_com = client.scheduler_comm
+    abst_comm = batch_send_com.comm
+    iostream = abst_comm.stream
+
+    msgs, batch_send_com.buffer = batch_send_com.buffer, []
+    msgs.append(msg)
+    context = {"sender": abst_comm._local_addr, "recipient": abst_comm._peer_addr},
+    frames = yield to_frames(msg, serializers=batch_send_com.serializers, on_error="raise", context=context)
+
+    lengths = [nbytes(frame) for frame in frames]
+    length_bytes = [struct.pack("Q", len(frames))] + [struct.pack("Q", x) for x in lengths]
+
+    futures = []
+
+    if six.PY3 and sum(lengths) < 2 ** 27:  # 128MB
+        futures.append(iostream.write(b"".join(length_bytes + frames)))  # send in one pass
+    else:
+        iostream.write(b"".join(length_bytes))  # avoid large memcpy, send in many
+        bytes_since_last_yield = 0
+        for frame in frames:
+            if not iostream_allows_memoryview:
+                frame = ensure_bytes(frame)
+            future = iostream.write(frame)
+            bytes_since_last_yield += nbytes(frame)
+            futures.append(future)
+            if bytes_since_last_yield > 2**28: # 256MB
+                yield futures
+                bytes_since_last_yield = 0
+                futures.clear()
+
+    if futures:
+        yield futures
+
+    raise gen.Return(sum(lengths))
+
+
+def addr_name_map(client=None, asynchronous=True):
+    client = client if client else global_cluster(asynchronous=asynchronous)
+
+    def scheduler_info_to_addr_name_map(scheduler_info):
+        return [(k, v['name']) for k, v in scheduler_info['workers'].items()]
+
+    if client.asynchronous:
+        result_future = gen.Future()
+        scheduler_info_future= gen.Future()
+
+        @gen.coroutine
+        def async_scheduler_info(fu):
+            sched_info = yield client.scheduler.identity()
+            fu.set_result(sched_info)
+
+        client.loop.add_callback(async_scheduler_info, scheduler_info_future)
+        scheduler_info_future.add_done_callback(lambda fu: result_future.set_result(scheduler_info_to_addr_name_map(fu.result())))
+        return result_future
+    else:
+        scheduler_info = client.sync(client.scheduler.identity)
+        return scheduler_info_to_addr_name_map(scheduler_info)
+
+
+def escape_cmd(cmd):
+    b64cmd = base64.b64encode(cmd.encode() if isinstance(cmd, str) else cmd)
+    b64exe = "echo '%s'  | base64 -d | bash" % b64cmd.decode()
+    return b64exe
+
+
+def safe_cmd(cmd, output=False):
+    if output:
+        return os.popen(escape_cmd(cmd)).read()
+    else:
+        return os.system(escape_cmd(cmd))
+
+
+def cluster_safe_cmd(client, cmd, workers=None):
+    exe = partial(safe_cmd, escape_cmd(cmd))
+    if client.asynchronous:
+        result_future = gen.Future()
+
+        @gen.coroutine
+        def async_exe(x, fu):
+            r = yield client.run(exe, workers=workers)
+            fu.set_result(r)
+        client.loop.add_callback(partial(async_exe, exe, result_future))
+
+        return result_future
+
+    else:
+        r = client.run(exe)
+        return r
+
+
+def model_cleanup(client, model_name, workers=None):
+    m_key = '%s:' % model_name
+    cmd = r"pkill -KILL -f %r " % m_key
+    print('CLUSTER CMD: %r' % cmd)
+    return cluster_safe_cmd(client, cmd, workers=workers)
 

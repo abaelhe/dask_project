@@ -9,20 +9,21 @@
 """
 
 import imp
-import six, os, sys, time, collections, socket, json, datetime, traceback, signal, zipimport
+import six, os, sys, time, collections, socket, json, datetime, traceback, signal, zipimport, threading, tornado
 from functools import partial,wraps,lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
 
-from tornado import gen
+from tornado import gen, locks
 from tornado import process
 from tornado.gen import coroutine, Return, Future
 from tornado.locks import Event, Condition, Lock, Semaphore, BoundedSemaphore
 
 from distributed import (Client, Worker, get_worker, secede as worker_secede, get_client, Reschedule, Pub, Sub, Lock,
                          Variable, worker_client)
+from distributed.protocol import to_serialize
 from distributed.threadpoolexecutor import secede as thread_pool_secede
-from distributed.worker import get_thread_identity, thread_state
+from distributed.worker import thread_state
 import logging
 
 
@@ -31,7 +32,7 @@ logger = logging.getLogger('distributed.preloading')
 
 from dask_usage import USAGE_INFO
 from dask_signal import IN_DASK, GLOBAL_IOLOOP
-from dask_global import (cuda_free_indexes, global_cluster, urlparse,
+from dask_global import (cuda_free_indexes, global_cluster, urlparse, safe_cmd, model_cleanup, async_send,
     DASK_PYTHONHASHSEED, DASK_PYTHON_INTERPRETER,
     DASK_READ_CHUNK_SIZE, DASK_WORKSPACE, DASK_DATA_POOL_DIR, DASK_MODEL_POOL_DIR)
 
@@ -92,7 +93,6 @@ class TFTaskType(object):
             device_filters = None
         self.device_filters  = device_filters
 
-
 # ref.: distributed:worker.py:run(server, comm, function, args=(), kwargs={}, is_coro=None, wait=True):
 # support builtin special kwargs:  dask_worker:server, dask_scheduler:server, ONLY available: distributed.client._run()
 
@@ -142,6 +142,7 @@ def tensorflow_options(gpu_mem_fraction=0.95):
 
 class TFActor(object):
     def __del__(self):
+
         self.recovery()
 
     def __str__(self):
@@ -151,7 +152,7 @@ class TFActor(object):
         # here we made this thread an OWNER of this task by secede from it's ThreadPoolExecutor.
         # NOTE: `thread_pool_secede` ONLY works in NON-coroutine actor_exectutor, ref:worker.actor_execute()
         self.dask_worker = get_worker()
-        self.thrid = get_thread_identity()
+        self.thrid = threading.get_ident()
 
         thread_pool_secede(adjust=True)
         self.dask_worker.loop.add_callback(self.dask_worker.transition, thread_state.key, "long-running")
@@ -190,31 +191,10 @@ class TFActor(object):
         self.args = args
         self.kwargs = kwargs
 
-
-        self.exe = None
-        self.result = Future()
-        self.dask_worker.loop.add_callback(self.flight, self.preflight())
-
-    @coroutine
-    def get_result(self):
-        self.log('Tensorflow wait RESULT ... ')
-        r = yield self.result
-        self.log('Tensorflow get RESULT: %s' % r)
-        raise Return(r)
-
-    @coroutine
-    def kill(self, sig=signal.SIGKILL, finish=True):
-        if self.exe:
-            try:
-                os.kill(self.exe.pid, sig)
-            except:
-                pass
-            self.exe = None
-
-        if finish:
-            self.recovery()
-
-        raise Return(0)
+        self.sub = Sub(self.key, worker=self.dask_worker)
+        self.result = Pub(model_name, worker=self.dask_worker)
+        self.exe = self.preflight()
+        self.dask_worker.loop.add_callback(self.flight, self.exe)
 
     def device_info(self, xla=None, gpu=True):
         if xla is None:
@@ -292,7 +272,6 @@ class TFActor(object):
         sys.path.insert(0, model_root)
         __import__(modname)
 
-
     def preflight(self):
         # this NODE is selected for this task
         node_name, node_port, cuda_indexes, dask_url = self.tf_config.pop('dask').split(':', 3)
@@ -302,8 +281,8 @@ class TFActor(object):
         using_xla_gpu_devices = self.device_info(xla=True, gpu=True)
         using_xla_gpu_device_names = sorted([x['name'] for x in using_xla_gpu_devices])
 
-        import tensorflow as tf
         if isinstance(self.tf_option, (str, bytes)):
+            import tensorflow as tf
             tf_option = tf.compat.v1.ConfigProto.FromString(self.tf_option)
         elif self.tf_option is not None:
             tf_option = self.tf_option
@@ -347,8 +326,13 @@ class TFActor(object):
         self.log(msg)
 
     def landed(self, retval=0):
-        self.result.set_result(retval)
-        msg = '\n ***** Tensorflow Task Finished, key:%s, ret:%s, pid:%s, ***** \n\n' % (self.key, retval, os.getpid())
+        self.log("worker pub msg: %s", {self.key: retval})
+        self.result.put({self.key: retval})
+        ident = yield self.dask_worker.scheduler.identity()
+        msg = yield self.sub._get(timeout=10)
+        self.log('Tensorflow Push Message Received, sub:%s, msg:%s, ident:%s' % (self.key, msg, ident))
+        msg = '\n ***** Tensorflow Task Finished, key:%s, ret:%s, tid:%s, pid:%s, ***** \n\n' % (
+            self.key, retval, threading.get_ident(), os.getpid())
         self.log(msg)
         self.recovery()
 
@@ -356,6 +340,7 @@ class TFActor(object):
         if self.sys_stdio is None:
             return
 
+        self.log('State Recovery:%s', self.key)
         os.chdir(self.dask_cwd)
         sys.__stdin__, sys.__stdout__, sys.__stderr__, sys.stdin, sys.stdout, sys.stderr = self.sys_stdio
         sys.path, sys.argv = self.sys_path, self.sys_argv
@@ -373,9 +358,12 @@ class TFActor(object):
                 self.stdout.flush()
 
         self.stdin = self.stdout = self.sys_stdio = self.sys_path = self.sys_argv = self.dask_worker = None
+        del self.result
+        del self.exe
+        del self.sub
 
 
-def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **tf_cluster_spec):
+def tensorflow_gen_config(free_node_name_map=None, parallel=1, save='~/tf_configs.json', **tf_cluster_spec):
     if free_node_name_map:
         r = [(url, name, indexes) for url, (name, indexes) in free_node_name_map.items() if len(indexes) > 0]
     else:
@@ -383,22 +371,23 @@ def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **t
         r =[(url, name, indexes) for url, (name, indexes) in client.run(cuda_free_indexes).items() if len(indexes) > 0]
 
     free_node_urls = sorted(r, key=lambda x: -len(x[-1]))
-    free_gpu_devices = collections.deque()
-    for (url, name, indexes) in free_node_urls:
-        free_gpu_devices.extend((url, name, idx) for idx in indexes)
+    free_gpu_devices = collections.deque([(url, name, x) for (url, name, indexes) in free_node_urls for x in indexes])
+    total_gpu_cores = len(free_gpu_devices)
+    if parallel > 1:
+        total_gpu_cores = max(1, int(total_gpu_cores // parallel))
+    #  tf_cluster_spec['worker'] = max(1, (len(free_gpu_devices)-2) // 10)# 预计同时会有10个同事跑GPU任务; 公平调度策略, 预留10个;
 
-    if len(free_gpu_devices) < 1:
+    if total_gpu_cores < 1:
         raise Exception('All Machines is busy, Total Available:%s' % len(free_node_urls))
-
-    if len(tf_cluster_spec) == 0:
-        tf_cluster_spec['chief'] = 1
-
-    if 'ps' not in tf_cluster_spec and len(free_gpu_devices) > tf_cluster_spec.get('chief', 0):
-        tf_cluster_spec['ps'] = 1
-
-    if 'worker' not in tf_cluster_spec and len(free_gpu_devices) > tf_cluster_spec.get('chief', 0):
-        tf_cluster_spec['worker'] = max(1, len(free_gpu_devices)-1)
-#        tf_cluster_spec['worker'] = max(1, (len(free_gpu_devices)-2) // 10)# 预计同时会有10个同事跑GPU任务; 公平调度策略, 预留10个;
+    if len(tf_cluster_spec) < 1:
+        if total_gpu_cores == 1:
+            tf_cluster_spec ={'chief': 1}
+        elif total_gpu_cores == 2:
+            tf_cluster_spec ={'chief': 1, 'worker':1}
+        elif total_gpu_cores == 3:
+            tf_cluster_spec ={'chief': 1, 'worker':2}
+        else:
+            tf_cluster_spec ={'chief': 1, 'ps': 1, 'worker':  max(1, len(free_gpu_devices)-2)}
 
     print('tf_cluster_spec: %s' % tf_cluster_spec)
     tf_cluster = collections.defaultdict(list)
@@ -458,26 +447,35 @@ def tensorflow_gen_config(free_node_name_map=None, save='~/tf_configs.json', **t
 def dask_sork_key(task_key):
     m, _, n = task_key.partition('@')
     (model_name, job_name, job_index), (node_name, cuda_index) = m.split(':'), n.split(':')
-    return model_name, TFTaskType.dic[job_name], job_index, node_name, cuda_index
+    return model_name, TFTaskType.dic[job_name], int(job_index), node_name, cuda_index
+
 
 @coroutine
 def startup_actors(scheduler_info, client, model_name, tf_option, tf_configs, future):
+    rsc = {'CUDA_GPU': 1}
     def gen_func(tf_config):
         job_name, job_index = tf_config['task']['type'], tf_config['task']['index']
         node_name, task_port, cuda_index, node_url = tf_config['dask'].split(':', 3)
         task_key = '%s:%s:%s@%s:%s' % (model_name, job_name, job_index, node_name, cuda_index)
+
         actor_startup = partial(client.submit, TFActor, task_key,
                 tf_config =tf_config, tf_option =tf_option, scheduler_info=scheduler_info,
-                key=task_key, workers=[node_url], retries=10, priority=100, allow_other_workers=False, actor=True)
+                key=task_key, workers=[node_url], resources=rsc,
+                fifo_timeout="100 ms",
+                retries=10,
+                priority=100,
+                allow_other_workers=False,
+                actor=True)
         return task_key, actor_startup
 
     startups =[gen_func(tf_config) for tf_config in tf_configs]
+    logger.info('Submitting: %s, Resources:%s',[x[0] for x in startups], rsc)
     actors = yield {k:s() for (k, s) in startups}
     future.set_result(actors)
 
 
 @coroutine # eg.: job_counts={'ps':10, 'workers':100}, ParameterServers:10, CUDAworkers:100
-def tensorflow_scheduler(model_name, client=None, tf_option=None, tf_port=None, **tf_cluster_spec):
+def tensorflow_scheduler(global_future, model_name, client=None, tf_option=None, tf_port=None, **tf_cluster_spec):
     scheduler_info =yield client.scheduler.identity()
     cuda_free_map =yield client.run(cuda_free_indexes)
     tf_configs = tensorflow_gen_config(free_node_name_map=cuda_free_map, **tf_cluster_spec)
@@ -511,12 +509,15 @@ def tensorflow_scheduler(model_name, client=None, tf_option=None, tf_port=None, 
     result_future.tf_option = tf_option
     result_future.cuda_map = cuda_free_map
 
-
     chief_future = Future()
     client.loop.add_callback(startup_actors, scheduler_info, client, model_name, tf_option, tf_configs, chief_future)
     chief_actors = yield chief_future
 
     sorted_task_keys = list(sorted(chief_actors.keys(), key=lambda x:dask_sork_key(x)))
+
+    sub = Sub(model_name, client=client)
+    pubs ={k: Pub(model_name, client=client) for k in sorted_task_keys}
+    scheduler_info =yield client.scheduler.identity() # data flush sync between this client and scheduler
 
     def chief_finish(task_key, actor, fu):
         value = fu.result()
@@ -526,18 +527,22 @@ def tensorflow_scheduler(model_name, client=None, tf_option=None, tf_port=None, 
             logger.info('Tensorflow Cluster All Finished: %s', chief_actors.keys())
 
     # Chief First.
-    for task_key in sorted_task_keys:
-        actor = chief_actors.pop(task_key)
-        logger.info('Tensorflow Started, key:%s', task_key)
-        actor_result = yield actor.get_result()
-        chief_actors[task_key] = actor_result
+    msgs = {}
+    chief_key_actor = sorted_task_keys[0]
 
-    A = yield chief_actors
+    while (len(msgs) + 1) < len(chief_actors):
+        msg = yield sub._get()
+        logger.info('Sub Rcv %s:%s', type(msg), msg)
+        msgs.update(msg)
 
-        #submit_task_wrap = partial(startup_task, model_name, tf_cfg, tf_option, client, scheduler_info, future)
-        #client.loop.run_in_executor(None, submit_task_wrap)# parallel startup.
-
-    raise Return(chief_actors)
+    import pdb;pdb.set_trace()
+    #    A = yield chief_actor.get_result()
+    assert chief_key_actor in msgs, 'Tensorflow Chief Task Required: %s' % chief_key_actor
+    time.sleep(1)
+    future = yield model_cleanup(client, model_name)
+    import pdb;pdb.set_trace()
+    logger.info("Tensorflow Task clean, %s", chief_actors)
+    global_future.set_result(chief_actors)
 
 
 def start_tensorflow(model_name, client=None, options=None, port=TF_PORT, **kwargs):
@@ -556,7 +561,7 @@ def start_tensorflow(model_name, client=None, options=None, port=TF_PORT, **kwar
     >>> tf_config = tf.compat.v1.OptimizerOptions()
     >>> tf_config.GlobalJitLevel = tf_config.OFF
     >>> tf_config.do_function_inlining = True
-    >> tf_config.opt_level 
+    >> tf_config.opt_level
     >>> tf_config.gpu_options.force_gpu_compatible = True
 
 
@@ -570,21 +575,14 @@ def start_tensorflow(model_name, client=None, options=None, port=TF_PORT, **kwar
                 '192.168.1.102:2222', '192.168.1.103:2222']
     }
     """
-    client = global_cluster(asynchronous=True) if client is None else client
-    import tensorflow as tf
-    options =(tf.compat.v1.ConfigProto.FromString(options) if isinstance(options, (str,bytes)) else (options if options else tensorflow_options())).SerializeToString()
-    tensorflow_scheduler_wrap = partial(tensorflow_scheduler, model_name, client=client, tf_option=options, tf_port=port, **kwargs)
+    client = client if client is not None else global_cluster(asynchronous=True)
+    global_future = Future()
+    tensorflow_scheduler_wrap = partial(tensorflow_scheduler, global_future, model_name, client=client, tf_port=port, **kwargs)
     if client.asynchronous:
-        result = [None]
-
-        def future_result(fut):
-            client.loop.stop()
-            result[0] = fut.result()
-
-        future = tensorflow_scheduler_wrap()
-        client.loop.add_future(future, lambda fut: future_result)
+        global_future.add_done_callback(lambda fu: client.loop.stop())
+        client.loop.add_callback(tensorflow_scheduler_wrap)
         client.loop.start()
-        result = result[0]
+        result = global_future.result()
     else:
         result = client.sync(client.loop, tensorflow_scheduler_wrap)
     return result
