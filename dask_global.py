@@ -12,20 +12,17 @@
 
 # Global Python Path
 # client = global_cluster(addr='tls://abael.com:8786', asynchronous=False)
-#MASTERS ='''gpu01.ops.zzyc.360es.cn'''.strip().splitlines()
+#MASTERS ='''gpu01.ops.zzyc.abael.com'''.strip().splitlines()
 MASTERS ='''abael.com'''.strip().splitlines()
-#gpu01.ops.zzyc.360es.cn
 MACHINES = '''
-gpu02.ops.zzyc.360es.cn
-gpu05.ops.zzyc.360es.cn
-gpu06.ops.zzyc.360es.cn
-gpu07.ops.zzyc.360es.cn
-gpu08.ops.zzyc.360es.cn
-gpu10.ops.zzyc.360es.cn
+gpu01.ops.zzyc.abael.com
+gpu02.ops.zzyc.abael.com
+gpu05.ops.zzyc.abael.com
+gpu06.ops.zzyc.abael.com
+gpu07.ops.zzyc.abael.com
+gpu08.ops.zzyc.abael.com
+gpu10.ops.zzyc.abael.com
 '''.strip().splitlines()
-#gpu04.ops.zzyc.360es.cn : Driver Update Required.
-#gpu02.ops.zzyc.360es.cn
-#gpu10.ops.zzyc.360es.cn
 
 
 from functools import partial
@@ -89,12 +86,11 @@ SECURITY_WORKER = Security(tls_ca_file=TLS_CA_FILE, tls_worker_cert=TLS_CA_CERT,
 SECURITY_CLIENT = Security(tls_ca_file=TLS_CA_FILE, tls_client_cert=TLS_CA_CERT, tls_client_key=TLS_CA_KEY, require_encryption=True)
 
 SCHEDULER_PORT = 8786
-#gpu09.ops.zzyc.360es.cn
 GLOBAL_CLUSTER = list(map(lambda m:'tls://%s:%s'%(m, SCHEDULER_PORT), MASTERS))[0]
 
 
 SSH_USER = 'heyijun'
-SSH_MASTER_ip = 'gpu01.ops.zzyc.360es.cn'
+SSH_MASTER_ip = 'gpu01.ops.zzyc.abael.com'
 SSH_PKEY = os.path.expanduser('~/.ssh/id_rsa')
 SSH_PUB = os.path.expanduser('~/.ssh/id_rsa.pub')
 SSH_WORKER_python = '/usr/bin/python3.6'
